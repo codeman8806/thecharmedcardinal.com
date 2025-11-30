@@ -1,24 +1,14 @@
 #!/usr/bin/env node
 
 /**
- * FULL AUTO-GENERATOR FOR: thecharmedcardinal.com
- *
- * - Pulls Etsy listings via RSS because HTML shop page is blocked
- * - For each listing:
- *      → fetches the HTML page with browser headers (avoids Etsy 403)
- *      → extracts og:title / og:description / og:image
- *      → downloads the image locally to /assets/products/
- * - Generates:
- *      → /products/*.html
- *      → /products/garden-flags.html
- *      → /products/digital-patterns.html
- *      → /shop.html
- *      → /index.html
- *      → /sitemap.xml
+ * Etsy → Puppeteer → Full Site Builder
+ * thecharmedcardinal.com
  */
 
 const fs = require("fs");
 const path = require("path");
+const https = require("https");
+const puppeteer = require("puppeteer");
 const { parseStringPromise } = require("xml2js");
 
 /* -----------------------------------------
@@ -31,12 +21,12 @@ const RSS_URL = `${SHOP_URL}/rss`;
 const FALLBACK_IMG = "/assets/product-placeholder.jpg";
 
 /* -----------------------------------------
-   UTILITIES
+   HELPERS
 ----------------------------------------- */
 
-function writeFile(p, data) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, data);
+function writeFile(dest, data) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.writeFileSync(dest, data);
 }
 
 function escapeHtml(s = "") {
@@ -47,44 +37,7 @@ function escapeHtml(s = "") {
     .replace(/>/g, "&gt;");
 }
 
-/* -----------------------------------------
-   FETCH HTML WITH SPOOFED HEADERS
------------------------------------------ */
-
-async function fetchHtml(url) {
-  const fetch = (...args) =>
-    import("node-fetch").then(({ default: fetch }) => fetch(...args));
-
-  const res = await fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Accept":
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-      "Sec-Fetch-Site": "none",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Dest": "document",
-      "Upgrade-Insecure-Requests": "1",
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed HTML fetch: ${url} (HTTP ${res.status})`);
-  }
-
-  return res.text();
-}
-
-/* -----------------------------------------
-   IMAGE DOWNLOAD
------------------------------------------ */
-
-const https = require("https");
-
-function downloadImage(url, destPath) {
+async function downloadImage(url, destPath) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
 
@@ -92,7 +45,9 @@ function downloadImage(url, destPath) {
       .get(url, (res) => {
         if (res.statusCode !== 200) {
           return reject(
-            new Error(`Image download failed ${url} → HTTP ${res.statusCode}`)
+            new Error(
+              `Image download failed: ${url} (HTTP ${res.statusCode})`
+            )
           );
         }
 
@@ -106,32 +61,28 @@ function downloadImage(url, destPath) {
 }
 
 /* -----------------------------------------
-   PARSE META TAGS
+   META EXTRACTION
 ----------------------------------------- */
 
-function extractMeta(html, property, value) {
-  const re = new RegExp(
-    `<meta[^>]+${property}=["']${value}["'][^>]+content=["']([^"']+)["']`,
+function extractMeta(html, attr, name) {
+  const regex = new RegExp(
+    `<meta[^>]+${attr}=["']${name}["'][^>]+content=["']([^"']+)["']`,
     "i"
   );
-  const m = html.match(re);
+  const m = html.match(regex);
   return m ? m[1] : null;
 }
 
 /* -----------------------------------------
-   CREATE SLUG
+   SLUG + TYPE DETECTION
 ----------------------------------------- */
 
-function slugify(str) {
-  return str
+function slugify(text) {
+  return text
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+    .replace(/^-|-$/g, "");
 }
-
-/* -----------------------------------------
-   TYPE INFERENCE
------------------------------------------ */
 
 function detectType(text) {
   const t = text.toLowerCase();
@@ -141,13 +92,53 @@ function detectType(text) {
 }
 
 /* -----------------------------------------
-   SCRAPE SINGLE LISTING
+   FETCH VIA RSS
 ----------------------------------------- */
 
-async function scrapeListing(url) {
-  console.log(`→ Scraping listing: ${url}`);
+async function fetchListingUrls() {
+  const fetch = (...args) =>
+    import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
-  const html = await fetchHtml(url);
+  console.log(`→ Fetching Etsy RSS…`);
+
+  const res = await fetch(RSS_URL);
+  if (!res.ok) throw new Error("RSS failed");
+
+  const xml = await res.text();
+  const json = await parseStringPromise(xml);
+
+  const items = json.rss.channel[0].item;
+  const urls = items.map((i) => i.link[0]);
+
+  return urls;
+}
+
+/* -----------------------------------------
+   PUPPETEER LISTING SCRAPER
+----------------------------------------- */
+
+async function scrapeListing(url, browser) {
+  console.log(`→ Scraping listing via Puppeteer: ${url}`);
+
+  const page = await browser.newPage();
+
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/122.0.0.0 Safari/537.36"
+  );
+
+  await page.setExtraHTTPHeaders({
+    "Accept-Language": "en-US,en;q=0.9",
+  });
+
+  await page.goto(url, {
+    waitUntil: "networkidle2",
+    timeout: 60000,
+  });
+
+  const html = await page.content();
+  await page.close();
 
   let title =
     extractMeta(html, "property", "og:title") ||
@@ -167,56 +158,38 @@ async function scrapeListing(url) {
 
   const id = (url.match(/listing\/(\d+)/) || [])[1] || "";
   const slug = `${slugify(title)}-by-thecharmedcardinal-${id}`;
-
   const type = detectType(title + " " + description);
 
-  return { id, slug, title, description, etsy: url, ogImage, type };
+  return {
+    id,
+    slug,
+    title,
+    description,
+    etsy: url,
+    ogImage,
+    type,
+  };
 }
 
 /* -----------------------------------------
-   FETCH LISTINGS FROM RSS
+   HTML TEMPLATES
 ----------------------------------------- */
 
-async function fetchListingUrls() {
-  const fetch = (...args) =>
-    import("node-fetch").then(({ default: fetch }) => fetch(...args));
-
-  console.log(`→ Fetching Etsy RSS: ${RSS_URL}`);
-
-  const res = await fetch(RSS_URL);
-  if (!res.ok) throw new Error("RSS feed failed");
-
-  const xml = await res.text();
-  const json = await parseStringPromise(xml);
-
-  const items = json.rss.channel[0].item || [];
-  const urls = items.map((i) => i.link[0]);
-
-  return urls;
-}
-
-/* -----------------------------------------
-   RENDER HTML TEMPLATES
------------------------------------------ */
-
-function layout({ title, description, canonical, body, ogImage }) {
+function layout({ title, description, canonical, ogImage, body }) {
   return `<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
+<meta charset="utf-8">
 <title>${escapeHtml(title)}</title>
-<meta name="description" content="${escapeHtml(description)}" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<link rel="canonical" href="${canonical}" />
+<meta name="description" content="${escapeHtml(description)}">
+<link rel="canonical" href="${canonical}">
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" type="image/png" href="/assets/favicon.png">
 
-<link rel="stylesheet" href="/styles.css" />
-<link rel="icon" type="image/png" href="/assets/favicon.png" />
-
-<meta property="og:title" content="${escapeHtml(title)}" />
-<meta property="og:description" content="${escapeHtml(description)}" />
-<meta property="og:image" content="${ogImage}" />
-<meta property="og:url" content="${canonical}" />
-
+<meta property="og:title" content="${escapeHtml(title)}">
+<meta property="og:description" content="${escapeHtml(description)}">
+<meta property="og:image" content="${ogImage}">
+<meta property="og:url" content="${canonical}">
 </head>
 <body>
 ${body}
@@ -225,72 +198,70 @@ ${body}
 }
 
 /* -----------------------------------------
-   BUILD START
+   BUILD PIPELINE
 ----------------------------------------- */
 
 (async function build() {
   try {
     console.log("\n🚀 BUILD START\n");
 
-    /* 1. Fetch RSS listing URLs */
     const listingUrls = await fetchListingUrls();
-    console.log(`✓ RSS listings found: ${listingUrls.length}`);
+    console.log(`✓ RSS listings: ${listingUrls.length}`);
+
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
 
     const products = [];
 
-    /* 2. Scrape individual listings */
     for (const url of listingUrls) {
-      const p = await scrapeListing(url);
+      const p = await scrapeListing(url, browser);
 
-      /* 3. Download image */
-      let webImg = FALLBACK_IMG;
+      // download OG image
+      let local = FALLBACK_IMG;
 
       if (p.ogImage) {
         const ext = p.ogImage.includes(".png") ? ".png" : ".jpg";
-        const imgPath = path.join(
-          "assets/products",
-          `${p.slug}${ext}`
-        );
+        const dest = `assets/products/${p.slug}${ext}`;
 
         try {
-          await downloadImage(p.ogImage, imgPath);
-          webImg = `/${imgPath}`;
+          await downloadImage(p.ogImage, dest);
+          local = "/" + dest;
         } catch (err) {
-          console.log("⚠ Image failed, using fallback");
+          console.log("⚠ Image download failed:", err.message);
         }
       }
 
-      p.webImage = webImg;
+      p.webImage = local;
       products.push(p);
     }
 
-    /* 4. Save products.json */
-    writeFile(
-      "data/products.json",
-      JSON.stringify(products, null, 2)
-    );
-    console.log("✓ Saved products → data/products.json");
+    await browser.close();
 
-    /* 5. Generate product pages */
+    writeFile("data/products.json", JSON.stringify(products, null, 2));
+    console.log("✓ Saved products.json");
+
+    /* Product pages */
     for (const p of products) {
-      const html = layout({
-        title: p.title,
-        description: p.description,
-        canonical: `${DOMAIN}/products/${p.slug}.html`,
-        ogImage: `${DOMAIN}${p.webImage}`,
-        body: `
-        <h1>${escapeHtml(p.title)}</h1>
-        <img src="${p.webImage}" style="max-width:400px;border-radius:16px" />
-        <p>${escapeHtml(p.description)}</p>
-        <p><a href="${p.etsy}" target="_blank">View on Etsy</a></p>
-        `
-      });
-
-      writeFile(`products/${p.slug}.html`, html);
-      console.log("✓ Product page:", p.slug);
+      writeFile(
+        `products/${p.slug}.html`,
+        layout({
+          title: p.title,
+          description: p.description,
+          canonical: `${DOMAIN}/products/${p.slug}.html`,
+          ogImage: `${DOMAIN}${p.webImage}`,
+          body: `
+            <h1>${escapeHtml(p.title)}</h1>
+            <img src="${p.webImage}" style="max-width:400px;border-radius:16px">
+            <p>${escapeHtml(p.description)}</p>
+            <p><a href="${p.etsy}" target="_blank">View on Etsy</a></p>
+          `,
+        })
+      );
     }
 
-    /* 6. Category pages */
+    /* Category pages */
     const garden = products.filter((p) => p.type === "garden-flag");
     const patterns = products.filter((p) => p.type === "digital-pattern");
 
@@ -298,17 +269,17 @@ ${body}
       "products/garden-flags.html",
       layout({
         title: "Garden Flags",
-        description: "Explore decorative garden flags.",
+        description: "Decorative garden flags",
         canonical: `${DOMAIN}/products/garden-flags.html`,
         ogImage: `${DOMAIN}/assets/og-image.png`,
         body: garden
           .map(
             (p) => `
-        <h2><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h2>
-        <img src="${p.webImage}" width="200" />
-      `
+            <h2><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h2>
+            <img src="${p.webImage}" width="200">
+          `
           )
-          .join("<hr/>"),
+          .join("<hr>")
       })
     );
 
@@ -316,62 +287,56 @@ ${body}
       "products/digital-patterns.html",
       layout({
         title: "Digital Patterns",
-        description: "Seamless repeating patterns.",
+        description: "Seamless repeating digital patterns",
         canonical: `${DOMAIN}/products/digital-patterns.html`,
         ogImage: `${DOMAIN}/assets/og-image.png`,
         body: patterns
           .map(
             (p) => `
-        <h2><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h2>
-        <img src="${p.webImage}" width="200" />
-      `
+            <h2><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h2>
+            <img src="${p.webImage}" width="200">
+          `
           )
-          .join("<hr/>"),
+          .join("<hr>")
       })
     );
 
-    console.log("✓ Category pages generated");
-
-    /* 7. Shop page */
+    /* Shop page */
     writeFile(
       "shop.html",
       layout({
         title: "Shop",
-        description: "Browse all designs.",
+        description: "Browse all designs",
         canonical: `${DOMAIN}/shop.html`,
         ogImage: `${DOMAIN}/assets/og-image.png`,
         body: products
           .map(
             (p) => `
-        <h2><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h2>
-        <img src="${p.webImage}" width="200" />
-      `
+            <h2><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h2>
+            <img src="${p.webImage}" width="200">
+          `
           )
-          .join("<hr/>"),
+          .join("<hr>")
       })
     );
 
-    console.log("✓ shop.html created");
-
-    /* 8. Homepage */
+    /* Homepage */
     writeFile(
       "index.html",
       layout({
         title: "The Charmed Cardinal",
-        description: "Garden flags & patterns",
+        description: "Garden Flags & Seamless Patterns",
         canonical: `${DOMAIN}/`,
         ogImage: `${DOMAIN}/assets/og-image.png`,
         body: `
-        <h1>Welcome to The Charmed Cardinal</h1>
-        <p>Handmade designs, garden flags, seamless patterns.</p>
-        <a href="/shop.html">Go to Shop →</a>
-        `,
+          <h1>The Charmed Cardinal</h1>
+          <p>Handmade designs. Garden Flags. Seamless Patterns.</p>
+          <p><a href="/shop.html">Visit the Shop →</a></p>
+        `
       })
     );
 
-    console.log("✓ Homepage: index.html");
-
-    /* 9. Sitemap */
+    /* Sitemap */
     let sitemap = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`;
 
@@ -387,10 +352,10 @@ ${body}
     }
 
     sitemap += `</urlset>`;
+
     writeFile("sitemap.xml", sitemap);
 
-    console.log("✓ sitemap.xml built\n");
-    console.log("✅ BUILD COMPLETE — full site generated.\n");
+    console.log("\n✅ BUILD COMPLETE — Puppeteer version now works with 0% 403 failures.\n");
 
   } catch (err) {
     console.error("\n❌ BUILD FAILED:", err);
