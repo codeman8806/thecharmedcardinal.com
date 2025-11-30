@@ -3,10 +3,11 @@ const path = require("path");
 const https = require("https");
 
 const DOMAIN = "https://thecharmedcardinal.com";
+const SHOP_URL = "https://www.etsy.com/shop/thecharmedcardinal";
 const DEFAULT_OG_IMAGE = `${DOMAIN}/assets/og-image.jpg`;
-const FALLBACK_PRODUCT_IMAGE_WEB = "/assets/product-placeholder.jpg"; // optional; will use if Etsy image fails
+const FALLBACK_PRODUCT_IMAGE_WEB = "/assets/product-placeholder.jpg"; // optional fallback
 
-// --- Helpers -------------------------------------------------------------
+// ----------------- Generic helpers -----------------
 
 function escapeHtml(str = "") {
   return String(str)
@@ -27,35 +28,29 @@ function writeFile(p, contents) {
 
 function fileExists(p) {
   try {
-    fs.accessSync(p, fs.constants.F_OK);
+    fs.accessSync(p, fs.constants.F_O
+K);
     return true;
   } catch {
     return false;
   }
 }
 
-// Simple GET for HTML (follows one level of redirect)
+// Simple HTTP GET (with basic redirect follow)
 function fetchHtml(url) {
   return new Promise((resolve, reject) => {
     https
       .get(url, (res) => {
-        // follow simple redirects
-        if (
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
           return resolve(fetchHtml(res.headers.location));
         }
-
         if (res.statusCode !== 200) {
           res.resume();
           return reject(
             new Error(`Request failed. Status code: ${res.statusCode} for ${url}`)
           );
         }
-
         let data = "";
         res.on("data", (chunk) => (data += chunk));
         res.on("end", () => resolve(data));
@@ -64,7 +59,7 @@ function fetchHtml(url) {
   });
 }
 
-// Download binary (image) to disk
+// Download binary file (image) to destPath
 function downloadBinary(url, destPath) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
@@ -95,21 +90,118 @@ function downloadBinary(url, destPath) {
   });
 }
 
-// Extract og:image from Etsy HTML
-function extractOgImage(html) {
-  const metaTagMatch = html.match(
-    /<meta[^>]+property=["']og:image["'][^>]*>/i
+function extractMeta(html, propOrName, value) {
+  const re = new RegExp(
+    `<meta[^>]+${propOrName}=["']${value}["'][^>]*>`,
+    "i"
   );
-  if (!metaTagMatch) return null;
-
-  const tag = metaTagMatch[0];
+  const tagMatch = html.match(re);
+  if (!tagMatch) return null;
+  const tag = tagMatch[0];
   const contentMatch = tag.match(/content=["']([^"']+)["']/i);
-  if (!contentMatch) return null;
-
-  return contentMatch[1];
+  return contentMatch ? contentMatch[1] : null;
 }
 
-// Ensure local product image exists; returns { webPath, absUrl } or null
+function slugFromTitleAndId(title, id) {
+  const base = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${base || "product"}-${id}`;
+}
+
+function inferType(title, description) {
+  const text = (title + " " + description).toLowerCase();
+  if (text.includes("flag")) return "garden-flag";
+  if (text.includes("pattern") || text.includes("seamless")) return "digital-pattern";
+  return "garden-flag"; // default
+}
+
+// ----------------- Etsy scraping -----------------
+
+async function fetchListingUrlsFromShop(maxPages = 5) {
+  const listingMap = new Map(); // id -> url
+
+  for (let page = 1; page <= maxPages; page++) {
+    const url = page === 1 ? SHOP_URL : `${SHOP_URL}?page=${page}`;
+    console.log(`→ Fetching shop page: ${url}`);
+    let html;
+    try {
+      html = await fetchHtml(url);
+    } catch (err) {
+      console.warn(`⚠ Failed to fetch shop page ${page}: ${err.message}`);
+      break;
+    }
+
+    const regex =
+      /https:\/\/www\.etsy\.com\/listing\/(\d+)[^"']*/g;
+    let m;
+    let foundOnThisPage = 0;
+    while ((m = regex.exec(html)) !== null) {
+      const id = m[1];
+      let listingUrl = m[0];
+      // Strip query params to keep canonical
+      const qIndex = listingUrl.indexOf("?");
+      if (qIndex !== -1) listingUrl = listingUrl.slice(0, qIndex);
+      if (!listingMap.has(id)) {
+        listingMap.set(id, listingUrl);
+        foundOnThisPage++;
+      }
+    }
+
+    console.log(`  • Found ${foundOnThisPage} listings on page ${page}`);
+
+    if (foundOnThisPage === 0) {
+      break; // no more pages with listings
+    }
+  }
+
+  const urls = Array.from(listingMap.values());
+  console.log(`✓ Total unique listings found: ${urls.length}`);
+  return urls;
+}
+
+async function fetchListingData(listingUrl) {
+  console.log(`→ Fetching listing: ${listingUrl}`);
+  const html = await fetchHtml(listingUrl);
+
+  const idMatch = listingUrl.match(/\/listing\/(\d+)/);
+  const id = idMatch ? idMatch[1] : "";
+
+  let title =
+    extractMeta(html, "property", "og:title") ||
+    extractMeta(html, "name", "title") ||
+    "Untitled listing";
+
+  // Etsy OG titles often have " - Etsy" appended; strip that
+  title = title.replace(/\s+-\s+Etsy\s*$/i, "");
+
+  let description =
+    extractMeta(html, "property", "og:description") ||
+    extractMeta(html, "name", "description") ||
+    "A handmade design from The Charmed Cardinal.";
+
+  // Same thing: some descriptions add "Shop now" / "On Etsy" boilerplate
+  description = description.replace(/(?:\s*-\s*Etsy.*)$/i, "").trim();
+
+  const ogImageUrl = extractMeta(html, "property", "og:image");
+
+  const type = inferType(title, description);
+  const slug = slugFromTitleAndId(title, id);
+
+  return {
+    id,
+    slug,
+    title,
+    description,
+    etsy: listingUrl,
+    type,
+    tags: [],
+    ogImageUrl,
+  };
+}
+
+// Download product image if needed; reuse if already exists
 async function ensureProductImage(product) {
   const assetsDir = path.join(__dirname, "..", "assets", "products");
   fs.mkdirSync(assetsDir, { recursive: true });
@@ -117,7 +209,7 @@ async function ensureProductImage(product) {
   const baseName = product.slug.replace(/[^a-z0-9\-]/gi, "-");
   const possibleExts = ["jpg", "jpeg", "png", "webp"];
 
-  // 1) If we already have a downloaded image, use it
+  // If we already have a local file, reuse it
   for (const ext of possibleExts) {
     const local = path.join(assetsDir, `${baseName}.${ext}`);
     if (fileExists(local)) {
@@ -126,38 +218,36 @@ async function ensureProductImage(product) {
     }
   }
 
-  // 2) Otherwise, scrape Etsy
+  if (!product.ogImageUrl) {
+    console.warn(`⚠ No og:image URL for ${product.title}`);
+    return null;
+  }
+
+  // Guess extension from URL
+  let ext = "jpg";
+  const lower = product.ogImageUrl.toLowerCase();
+  if (lower.includes(".png")) ext = "png";
+  else if (lower.includes(".webp")) ext = "webp";
+  else if (lower.includes(".jpeg")) ext = "jpeg";
+
+  const filename = `${baseName}.${ext}`;
+  const destPath = path.join(assetsDir, filename);
+
+  console.log(`→ Downloading image: ${product.ogImageUrl}`);
   try {
-    console.log(`→ Fetching Etsy page for image: ${product.etsy}`);
-    const html = await fetchHtml(product.etsy);
-    const ogImageUrl = extractOgImage(html);
-    if (!ogImageUrl) {
-      console.warn(`⚠ No og:image found for ${product.etsy}`);
-      return null;
-    }
-
-    // Guess extension from URL
-    let ext = "jpg";
-    const lower = ogImageUrl.toLowerCase();
-    if (lower.includes(".png")) ext = "png";
-    else if (lower.includes(".webp")) ext = "webp";
-    else if (lower.includes(".jpeg")) ext = "jpeg";
-
-    const filename = `${baseName}.${ext}`;
-    const destPath = path.join(assetsDir, filename);
-
-    console.log(`→ Downloading image to ${destPath}`);
-    await downloadBinary(ogImageUrl, destPath);
-
+    await downloadBinary(product.ogImageUrl, destPath);
     const webPath = `/assets/products/${filename}`;
     return { webPath, absUrl: `${DOMAIN}${webPath}` };
   } catch (err) {
-    console.error(`⚠ Failed to fetch/download Etsy image for ${product.slug}:`, err.message);
+    console.warn(
+      `⚠ Failed to download image for ${product.title}: ${err.message}`
+    );
     return null;
   }
 }
 
-// Shared layout: header/footer with nav, OG/Twitter, etc.
+// ----------------- Layout + rendering -----------------
+
 function renderLayout({
   title,
   description,
@@ -179,6 +269,7 @@ function renderLayout({
   <link rel="canonical" href="${canonical}" />
 
   <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" type="image/png" href="/assets/favicon.png" />
 
   <meta property="og:title" content="${safeTitle}" />
   <meta property="og:description" content="${safeDesc}" />
@@ -236,16 +327,6 @@ function renderLayout({
 </html>`;
 }
 
-// --- Load data -----------------------------------------------------------
-
-const productsPath = path.join(__dirname, "..", "data", "products.json");
-const products = readJson(productsPath);
-
-const gardenFlags = products.filter((p) => p.type === "garden-flag");
-const digitalPatterns = products.filter((p) => p.type === "digital-pattern");
-
-// --- Render helpers ------------------------------------------------------
-
 function renderBreadcrumb(items) {
   return `
     <nav aria-label="Breadcrumb" class="section-footnote" style="margin-bottom: 0.75rem;">
@@ -273,7 +354,6 @@ function renderTags(tags = []) {
   `;
 }
 
-// Product detail (hero) page
 function renderProductPage(product, relatedProducts, imageInfo) {
   const url = `${DOMAIN}/products/${product.slug}.html`;
 
@@ -386,7 +466,6 @@ ${JSON.stringify(jsonLd, null, 2)}
   });
 }
 
-// Category pages
 function renderCategoryPage({ title, slug, intro, items }) {
   const url = `${DOMAIN}/products/${slug}.html`;
 
@@ -430,8 +509,7 @@ function renderCategoryPage({ title, slug, intro, items }) {
   });
 }
 
-// Shop overview (root /shop.html)
-function renderShopPage() {
+function renderShopPage(gardenFlags, digitalPatterns) {
   const url = `${DOMAIN}/shop.html`;
 
   const bodyHtml = `
@@ -486,7 +564,7 @@ function renderShopPage() {
 
         <p class="section-footnote" style="margin-top:2rem;">
           Want to see everything in one place? Visit the full Etsy shop:
-          <a href="https://www.etsy.com/shop/TheCharmedCardinal" target="_blank" rel="noopener noreferrer">
+          <a href="${SHOP_URL}" target="_blank" rel="noopener noreferrer">
             The Charmed Cardinal on Etsy
           </a>.
         </p>
@@ -503,19 +581,57 @@ function renderShopPage() {
   });
 }
 
-// --- Build step ----------------------------------------------------------
+// ----------------- Build pipeline -----------------
 
 (async function build() {
   try {
     const outRoot = path.join(__dirname, "..");
 
-    // 1) Product detail pages (with Etsy image scraping)
+    // 1) Pull all listings from Etsy and build product objects
+    const listingUrls = await fetchListingUrlsFromShop();
+    const products = [];
+    for (const url of listingUrls) {
+      try {
+        const p = await fetchListingData(url);
+        products.push(p);
+      } catch (err) {
+        console.warn(`⚠ Skipping listing due to error: ${err.message}`);
+      }
+    }
+
+    if (!products.length) {
+      throw new Error("No products scraped from Etsy – cannot build site.");
+    }
+
+    // 2) Write products.json for transparency/debugging
+    const productsJsonPath = path.join(outRoot, "data", "products.json");
+    writeFile(
+      productsJsonPath,
+      JSON.stringify(
+        products.map((p) => ({
+          slug: p.slug,
+          title: p.title,
+          type: p.type,
+          description: p.description,
+          etsy: p.etsy,
+          tags: p.tags,
+        })),
+        null,
+        2
+      )
+    );
+    console.log(`✓ Wrote ${products.length} products to data/products.json`);
+
+    const gardenFlags = products.filter((p) => p.type === "garden-flag");
+    const digitalPatterns = products.filter((p) => p.type === "digital-pattern");
+
+    // 3) Product detail pages (with image download)
     for (const product of products) {
       const related = products
         .filter((p) => p.slug !== product.slug && p.type === product.type)
         .slice(0, 3);
 
-      const imageInfo = await ensureProductImage(product); // may be null
+      const imageInfo = await ensureProductImage(product);
       const html = renderProductPage(product, related, imageInfo);
 
       const outPath = path.join(outRoot, "products", `${product.slug}.html`);
@@ -523,7 +639,7 @@ function renderShopPage() {
       console.log("✓ Product page:", outPath);
     }
 
-    // 2) Category pages
+    // 4) Category pages
     const gardenFlagsPage = renderCategoryPage({
       title: "Garden Flags",
       slug: "garden-flags",
@@ -547,12 +663,12 @@ function renderShopPage() {
     );
     console.log("✓ Category page: products/digital-patterns.html");
 
-    // 3) Shop overview
-    const shopHtml = renderShopPage();
+    // 5) Shop overview
+    const shopHtml = renderShopPage(gardenFlags, digitalPatterns);
     writeFile(path.join(outRoot, "shop.html"), shopHtml);
     console.log("✓ Shop page: shop.html");
 
-    // 4) Sitemap with all pages
+    // 6) Sitemap
     const staticPages = [
       "",
       "about.html",
