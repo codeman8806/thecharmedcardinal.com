@@ -454,7 +454,6 @@ function renderHomePage(products) {
       <p class="section-footnote">
         <a href="/shop.html">View all products →</a>
       </p>
-    </section>
   </section>`;
 
   return renderLayout({
