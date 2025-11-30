@@ -434,21 +434,17 @@ function renderHomePage(products) {
   const featured = products.slice(0, 6);
 
   const bodyHtml = `
-  <section>
-    <div class="hero">
-      <div class="hero-copy">
-        <h1>Welcome to The Charmed Cardinal</h1>
-        <p>
-          Explore handcrafted garden flags, porch decor, and digital print patterns inspired by nature, dogs, and cozy outdoor living.
-        </p>
-        <div class="hero-actions">
-          <a href="/shop.html" class="etsy-btn">Browse the shop →</a>
-          <a href="${SHOP_URL}" target="_blank" rel="noopener noreferrer" class="text-link">
-            Visit Etsy →
-          </a>
-        </div>
-      </div>
+<section class="hero">
+  <div class="hero-inner">
+    <img src="/assets/og-image.png" alt="The Charmed Cardinal Featured Artwork">
+    <div class="hero-text">
+      <h1>Welcome to The Charmed Cardinal</h1>
+      <p>Handcrafted garden flags, seamless patterns, and nature-inspired designs.</p>
+      <a href="/shop.html" class="hero-btn">Shop Now →</a>
     </div>
+  </div>
+</section>
+
 
     <section class="featured">
       <h2>Featured Products</h2>
