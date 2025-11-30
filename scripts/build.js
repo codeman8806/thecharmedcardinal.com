@@ -139,14 +139,14 @@ async function scrapeListing(url, browser) {
   // Scroll & re-check JSON-LD
   if (!productData) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(1200);
+    await new Promise(res => setTimeout(res, 1200));
     productData = await getJsonLdProduct();
   }
 
   // Scroll to top again
   if (!productData) {
     await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(800);
+    await new Promise(res => setTimeout(res, 800));
     productData = await getJsonLdProduct();
   }
 
