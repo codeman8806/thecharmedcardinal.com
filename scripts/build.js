@@ -1,24 +1,37 @@
+/**
+ * build.js — FULL UPDATED VERSION
+ * Etsy → Static SEO Site Generator for thecharmedcardinal.com
+ * Supports:
+ *  - Puppeteer HTML fetch
+ *  - DOM-rendered Etsy listing scraping
+ *  - OG image extraction
+ *  - Category pages
+ *  - Product detail pages
+ *  - Sitemap
+ */
+
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+const puppeteer = require("puppeteer");
 
+// ---------------------------------------------
+// CONFIG
+// ---------------------------------------------
 const DOMAIN = "https://thecharmedcardinal.com";
 const SHOP_URL = "https://www.etsy.com/shop/thecharmedcardinal";
 const DEFAULT_OG_IMAGE = `${DOMAIN}/assets/og-image.jpg`;
-const FALLBACK_PRODUCT_IMAGE_WEB = "/assets/product-placeholder.jpg"; // optional fallback
+const FALLBACK_PRODUCT_IMAGE_WEB = "/assets/product-placeholder.jpg";
 
-// ----------------- Generic helpers -----------------
-
+// ---------------------------------------------
+// GENERIC HELPERS
+// ---------------------------------------------
 function escapeHtml(str = "") {
   return String(str)
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-}
-
-function readJson(p) {
-  return JSON.parse(fs.readFileSync(p, "utf8"));
 }
 
 function writeFile(p, contents) {
@@ -35,27 +48,18 @@ function fileExists(p) {
   }
 }
 
-// Simple HTTP GET (with basic redirect follow)
-const puppeteer = require("puppeteer");
-
-// Replace old fetchHtml with Puppeteer-powered version
+// ---------------------------------------------
+// FETCH HTML WITH PUPPETEER
+// ---------------------------------------------
 async function fetchHtml(url) {
   const browser = await puppeteer.launch({
-    headless: "new",  // fastest & most compatible mode
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled",
-    ],
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
   try {
     const page = await browser.newPage();
-
-    // Spoof real Chrome headers
-    await page.setExtraHTTPHeaders({
-      "Accept-Language": "en-US,en;q=0.9",
-    });
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
@@ -63,21 +67,17 @@ async function fetchHtml(url) {
         "Chrome/120.0.0.0 Safari/537.36"
     );
 
-    await page.goto(url, {
-      waitUntil: "networkidle2",
-      timeout: 60000,
-    });
-
-    const content = await page.content();
-    return content;
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+    const html = await page.content();
+    return html;
   } finally {
     await browser.close();
   }
 }
 
-
-
-// Download binary file (image) to destPath
+// ---------------------------------------------
+// DOWNLOAD BINARY IMAGE
+// ---------------------------------------------
 function downloadBinary(url, destPath) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
@@ -85,302 +85,266 @@ function downloadBinary(url, destPath) {
     https
       .get(url, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          res.resume();
           return resolve(downloadBinary(res.headers.location, destPath));
         }
-
         if (res.statusCode !== 200) {
-          res.resume();
-          return reject(
-            new Error(
-              `Image download failed. Status code: ${res.statusCode} for ${url}`
-            )
-          );
+          return reject(new Error(`Image download failed (${res.statusCode}) for ${url}`));
         }
 
         const fileStream = fs.createWriteStream(destPath);
         res.pipe(fileStream);
-        fileStream.on("finish", () => {
-          fileStream.close(() => resolve(destPath));
-        });
+        fileStream.on("finish", () => fileStream.close(() => resolve(destPath)));
       })
       .on("error", reject);
   });
 }
 
+// ---------------------------------------------
+// META TAG EXTRACTION
+// ---------------------------------------------
 function extractMeta(html, propOrName, value) {
   const re = new RegExp(
     `<meta[^>]+${propOrName}=["']${value}["'][^>]*>`,
     "i"
   );
-  const tagMatch = html.match(re);
-  if (!tagMatch) return null;
-  const tag = tagMatch[0];
-  const contentMatch = tag.match(/content=["']([^"']+)["']/i);
-  return contentMatch ? contentMatch[1] : null;
+  const tag = html.match(re);
+  if (!tag) return null;
+  const match = tag[0].match(/content=["']([^"']+)["']/i);
+  return match ? match[1] : null;
 }
 
+// ---------------------------------------------
+// SLUG + TYPE
+// ---------------------------------------------
 function slugFromTitleAndId(title, id) {
   const base = title
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return `${base || "product"}-${id}`;
+  return `${base}-${id}`;
 }
 
 function inferType(title, description) {
   const text = (title + " " + description).toLowerCase();
-  if (text.includes("flag")) return "garden-flag";
   if (text.includes("pattern") || text.includes("seamless")) return "digital-pattern";
-  return "garden-flag"; // default
+  if (text.includes("flag")) return "garden-flag";
+  return "garden-flag";
 }
 
-// ----------------- Etsy scraping -----------------
-
+// ---------------------------------------------
+// SCRAPE ETSY LISTINGS (DOM-RENDERED)
+// ---------------------------------------------
 async function fetchListingUrlsFromShop(maxPages = 5) {
-  const listingMap = new Map(); // id -> url
+  const listingMap = new Map();
 
-  for (let page = 1; page <= maxPages; page++) {
-    const url = page === 1 ? SHOP_URL : `${SHOP_URL}?page=${page}`;
-    console.log(`→ Fetching shop page: ${url}`);
-    let html;
-    try {
-      html = await fetchHtml(url);
-    } catch (err) {
-      console.warn(`⚠ Failed to fetch shop page ${page}: ${err.message}`);
-      break;
-    }
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
 
-    const regex =
-      /https:\/\/www\.etsy\.com\/listing\/(\d+)[^"']*/g;
-    let m;
-    let foundOnThisPage = 0;
-    while ((m = regex.exec(html)) !== null) {
-      const id = m[1];
-      let listingUrl = m[0];
-      // Strip query params to keep canonical
-      const qIndex = listingUrl.indexOf("?");
-      if (qIndex !== -1) listingUrl = listingUrl.slice(0, qIndex);
-      if (!listingMap.has(id)) {
-        listingMap.set(id, listingUrl);
-        foundOnThisPage++;
-      }
-    }
+  const page = await browser.newPage();
+  await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-    console.log(`  • Found ${foundOnThisPage} listings on page ${page}`);
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/120.0.0.0 Safari/537.36"
+  );
 
-    if (foundOnThisPage === 0) {
-      break; // no more pages with listings
-    }
+  for (let p = 1; p <= maxPages; p++) {
+    const url = p === 1 ? SHOP_URL : `${SHOP_URL}?page=${p}`;
+    console.log(`→ Fetching shop page (rendered DOM): ${url}`);
+
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+
+    const urls = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href*="/listing/"]'));
+      const cleaned = anchors.map((a) => a.href.split("?")[0]);
+      return Array.from(new Set(cleaned));
+    });
+
+    console.log(`  • Found ${urls.length} listings on page ${p}`);
+
+    urls.forEach((u) => {
+      const m = u.match(/\/listing\/(\d+)/);
+      if (m) listingMap.set(m[1], u);
+    });
+
+    if (urls.length === 0) break;
   }
 
-  const urls = Array.from(listingMap.values());
-  console.log(`✓ Total unique listings found: ${urls.length}`);
-  return urls;
+  await browser.close();
+
+  const final = Array.from(listingMap.values());
+  console.log(`✓ Total unique listings: ${final.length}`);
+
+  return final;
 }
 
+// ---------------------------------------------
+// SCRAPE INDIVIDUAL LISTINGS
+// ---------------------------------------------
 async function fetchListingData(listingUrl) {
   console.log(`→ Fetching listing: ${listingUrl}`);
   const html = await fetchHtml(listingUrl);
 
-  const idMatch = listingUrl.match(/\/listing\/(\d+)/);
-  const id = idMatch ? idMatch[1] : "";
+  const id = (listingUrl.match(/\/listing\/(\d+)/) || [null, ""])[1];
 
   let title =
     extractMeta(html, "property", "og:title") ||
     extractMeta(html, "name", "title") ||
     "Untitled listing";
 
-  // Etsy OG titles often have " - Etsy" appended; strip that
   title = title.replace(/\s+-\s+Etsy\s*$/i, "");
 
   let description =
     extractMeta(html, "property", "og:description") ||
     extractMeta(html, "name", "description") ||
-    "A handmade design from The Charmed Cardinal.";
+    "";
 
-  // Same thing: some descriptions add "Shop now" / "On Etsy" boilerplate
   description = description.replace(/(?:\s*-\s*Etsy.*)$/i, "").trim();
 
   const ogImageUrl = extractMeta(html, "property", "og:image");
 
-  const type = inferType(title, description);
-  const slug = slugFromTitleAndId(title, id);
-
   return {
     id,
-    slug,
+    slug: slugFromTitleAndId(title, id),
     title,
     description,
     etsy: listingUrl,
-    type,
+    type: inferType(title, description),
     tags: [],
     ogImageUrl,
   };
 }
 
-// Download product image if needed; reuse if already exists
+// ---------------------------------------------
+// IMAGE DOWNLOAD
+// ---------------------------------------------
 async function ensureProductImage(product) {
-  const assetsDir = path.join(__dirname, "..", "assets", "products");
-  fs.mkdirSync(assetsDir, { recursive: true });
+  const dir = path.join(__dirname, "..", "assets", "products");
+  fs.mkdirSync(dir, { recursive: true });
 
-  const baseName = product.slug.replace(/[^a-z0-9\-]/gi, "-");
-  const possibleExts = ["jpg", "jpeg", "png", "webp"];
+  const name = product.slug.replace(/[^a-z0-9\-]/gi, "-");
 
-  // If we already have a local file, reuse it
-  for (const ext of possibleExts) {
-    const local = path.join(assetsDir, `${baseName}.${ext}`);
-    if (fileExists(local)) {
-      const webPath = `/assets/products/${baseName}.${ext}`;
-      return { webPath, absUrl: `${DOMAIN}${webPath}` };
+  for (const ext of ["jpg", "jpeg", "png", "webp"]) {
+    const file = path.join(dir, `${name}.${ext}`);
+    if (fileExists(file)) {
+      return {
+        webPath: `/assets/products/${name}.${ext}`,
+        absUrl: `${DOMAIN}/assets/products/${name}.${ext}`,
+      };
     }
   }
 
-  if (!product.ogImageUrl) {
-    console.warn(`⚠ No og:image URL for ${product.title}`);
-    return null;
-  }
+  if (!product.ogImageUrl) return null;
 
-  // Guess extension from URL
   let ext = "jpg";
   const lower = product.ogImageUrl.toLowerCase();
   if (lower.includes(".png")) ext = "png";
   else if (lower.includes(".webp")) ext = "webp";
   else if (lower.includes(".jpeg")) ext = "jpeg";
 
-  const filename = `${baseName}.${ext}`;
-  const destPath = path.join(assetsDir, filename);
+  const filename = `${name}.${ext}`;
+  const dest = path.join(dir, filename);
 
   console.log(`→ Downloading image: ${product.ogImageUrl}`);
+
   try {
-    await downloadBinary(product.ogImageUrl, destPath);
-    const webPath = `/assets/products/${filename}`;
-    return { webPath, absUrl: `${DOMAIN}${webPath}` };
+    await downloadBinary(product.ogImageUrl, dest);
+    return {
+      webPath: `/assets/products/${filename}`,
+      absUrl: `${DOMAIN}/assets/products/${filename}`,
+    };
   } catch (err) {
-    console.warn(
-      `⚠ Failed to download image for ${product.title}: ${err.message}`
-    );
+    console.warn(`⚠ Failed to download image: ${err.message}`);
     return null;
   }
 }
 
-// ----------------- Layout + rendering -----------------
-
-function renderLayout({
-  title,
-  description,
-  canonical,
-  bodyHtml,
-  extraHead = "",
-  ogImage = DEFAULT_OG_IMAGE,
-}) {
-  const safeTitle = escapeHtml(title);
-  const safeDesc = escapeHtml(description);
-
+// ---------------------------------------------
+// PAGE RENDERING (layout, category, shop, product)
+// ---------------------------------------------
+function renderLayout({ title, description, canonical, bodyHtml, extraHead = "", ogImage = DEFAULT_OG_IMAGE }) {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>${safeTitle}</title>
-  <meta name="description" content="${safeDesc}" />
+  <title>${escapeHtml(title)}</title>
+  <meta name="description" content="${escapeHtml(description)}" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="canonical" href="${canonical}" />
-
   <link rel="stylesheet" href="/styles.css" />
   <link rel="icon" type="image/png" href="/assets/favicon.png" />
 
-  <meta property="og:title" content="${safeTitle}" />
-  <meta property="og:description" content="${safeDesc}" />
+  <meta property="og:title" content="${escapeHtml(title)}" />
+  <meta property="og:description" content="${escapeHtml(description)}" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="${canonical}" />
   <meta property="og:image" content="${ogImage}" />
 
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="${safeTitle}" />
-  <meta name="twitter:description" content="${safeDesc}" />
+  <meta name="twitter:title" content="${escapeHtml(title)}" />
+  <meta name="twitter:description" content="${escapeHtml(description)}" />
   <meta name="twitter:image" content="${ogImage}" />
 
   ${extraHead}
 </head>
 <body>
-  <header class="site-header">
-    <div class="container header-inner">
-      <a href="/" class="brand">
-        <span class="brand-mark">🕊️</span>
-        <span class="brand-text">
-          <span class="brand-name">The Charmed Cardinal</span>
-          <span class="brand-tagline">Garden Flags & Seamless Patterns</span>
-        </span>
-      </a>
+<header class="site-header">
+  <div class="container header-inner">
+    <a href="/" class="brand">
+      <span class="brand-mark">🕊️</span>
+      <span class="brand-text">
+        <span class="brand-name">The Charmed Cardinal</span>
+        <span class="brand-tagline">Garden Flags & Seamless Patterns</span>
+      </span>
+    </a>
+    <nav class="main-nav">
+      <a href="/">Home</a>
+      <a href="/shop.html">Shop</a>
+      <a href="/about.html">About</a>
+      <a href="/blog/">Blog</a>
+      <a href="/index.html#contact">Contact</a>
+    </nav>
+  </div>
+</header>
 
-      <nav class="main-nav">
-        <a href="/">Home</a>
-        <a href="/shop.html">Shop</a>
-        <a href="/about.html">About</a>
-        <a href="/blog/">Blog</a>
-        <a href="/index.html#contact">Contact</a>
-      </nav>
-    </div>
-  </header>
+<main>
+${bodyHtml}
+</main>
 
-  <main>
-    ${bodyHtml}
-  </main>
-
-  <footer class="site-footer">
-    <div class="container footer-inner">
-      <p>&copy; <span id="year"></span> The Charmed Cardinal. All rights reserved.</p>
-      <nav class="footer-nav">
-        <a href="/">Home</a>
-        <a href="/shop.html">Shop</a>
-        <a href="/about.html">About</a>
-        <a href="/blog/">Blog</a>
-      </nav>
-    </div>
-    <script>
-      document.getElementById('year').textContent = new Date().getFullYear();
-    </script>
-  </footer>
+<footer class="site-footer">
+  <div class="container footer-inner">
+    <p>&copy; <span id="year"></span> The Charmed Cardinal. All rights reserved.</p>
+  </div>
+  <script>document.getElementById('year').textContent = new Date().getFullYear();</script>
+</footer>
 </body>
 </html>`;
 }
 
-function renderBreadcrumb(items) {
+function renderBreadcrumb(list) {
   return `
-    <nav aria-label="Breadcrumb" class="section-footnote" style="margin-bottom: 0.75rem;">
-      ${items
-        .map((item, i) => {
-          if (!item.href || i === items.length - 1) {
-            return `<span>${escapeHtml(item.label)}</span>`;
-          }
-          return `<a href="${item.href}">${escapeHtml(item.label)}</a> &raquo; `;
-        })
-        .join("")}
-    </nav>
-  `;
+<nav class="breadcrumbs">
+  ${list
+    .map((b, i) =>
+      b.href && i < list.length - 1
+        ? `<a href="${b.href}">${escapeHtml(b.label)}</a> &raquo; `
+        : `<span>${escapeHtml(b.label)}</span>`
+    )
+    .join("")}
+</nav>`;
 }
 
-function renderTags(tags = []) {
-  if (!tags.length) return "";
-  return `
-    <p class="section-footnote" style="margin-top: 0.75rem;">
-      <strong>Tags:</strong>
-      ${tags
-        .map((t) => `<span style="display:inline-block;margin-right:0.35rem;">${escapeHtml(t)}</span>`)
-        .join("")}
-    </p>
-  `;
-}
-
-function renderProductPage(product, relatedProducts, imageInfo) {
+function renderProductPage(product, related, imageInfo) {
   const url = `${DOMAIN}/products/${product.slug}.html`;
 
-  const imageWebPath = imageInfo?.webPath || FALLBACK_PRODUCT_IMAGE_WEB;
   const imageAbsUrl =
     imageInfo?.absUrl ||
-    (FALLBACK_PRODUCT_IMAGE_WEB
-      ? `${DOMAIN}${FALLBACK_PRODUCT_IMAGE_WEB}`
-      : DEFAULT_OG_IMAGE);
+    (FALLBACK_PRODUCT_IMAGE_WEB ? `${DOMAIN}${FALLBACK_PRODUCT_IMAGE_WEB}` : DEFAULT_OG_IMAGE);
+
+  const imageWebPath = imageInfo?.webPath || FALLBACK_PRODUCT_IMAGE_WEB;
 
   const jsonLd = {
     "@context": "https://schema.org",
@@ -388,99 +352,59 @@ function renderProductPage(product, relatedProducts, imageInfo) {
     "name": product.title,
     "image": [imageAbsUrl],
     "description": product.description,
-    "brand": {
-      "@type": "Brand",
-      "name": "The Charmed Cardinal"
-    },
+    "brand": { "@type": "Brand", "name": "The Charmed Cardinal" },
     "url": url,
     "offers": {
       "@type": "Offer",
       "url": product.etsy,
-      "availability": "https://schema.org/InStock"
-    }
+      "availability": "https://schema.org/InStock",
+    },
   };
 
-  const extraHead = `
-<script type="application/ld+json">
-${JSON.stringify(jsonLd, null, 2)}
-</script>
-  `;
-
-  const breadcrumbItems = [
-    { label: "Home", href: "/" },
-    { label: "Shop", href: "/shop.html" },
-  ];
-
-  if (product.type === "garden-flag") {
-    breadcrumbItems.push({ label: "Garden Flags", href: "/products/garden-flags.html" });
-  } else if (product.type === "digital-pattern") {
-    breadcrumbItems.push({ label: "Digital Patterns", href: "/products/digital-patterns.html" });
-  }
-
-  breadcrumbItems.push({ label: product.title });
-
-  const relatedHtml = relatedProducts.length
-    ? `
-    <section class="section">
-      <div class="container">
-        <h2>Related ${product.type === "garden-flag" ? "garden flags" : "patterns"}</h2>
-        <div class="card-grid">
-          ${relatedProducts
-            .map(
-              (rp) => `
-            <article class="card">
-              <h3><a href="/products/${rp.slug}.html">${escapeHtml(rp.title)}</a></h3>
-              <p>${escapeHtml(rp.description)}</p>
-              <a class="card-link" href="/products/${rp.slug}.html">View details →</a>
-            </article>
-          `
-            )
-            .join("")}
-        </div>
-      </div>
-    </section>
-  `
-    : "";
-
   const bodyHtml = `
-    <section class="section section-alt">
-      <div class="container">
-        ${renderBreadcrumb(breadcrumbItems)}
-        <div class="grid-two">
-          <div class="hero-image">
-            <img src="${imageWebPath}" alt="${escapeHtml(
-    product.title
-  )}" style="width:100%;border-radius:22px;box-shadow:0 10px 25px rgba(15,23,42,0.15);" />
-          </div>
-          <div class="hero-copy">
-            <h1>${escapeHtml(product.title)}</h1>
-            <p>${escapeHtml(product.description)}</p>
-            <p><strong>Category:</strong> ${
-              product.type === "garden-flag" ? "Garden Flag" : "Digital Seamless Pattern"
-            }</p>
-            ${renderTags(product.tags)}
-            <div class="hero-actions">
-              <a class="btn primary" href="${product.etsy}" target="_blank" rel="noopener noreferrer">
-                View on Etsy
-              </a>
-              <a class="btn secondary" href="/shop.html">
-                Back to shop
-              </a>
-            </div>
-          </div>
+<section class="section">
+  <div class="container">
+    ${renderBreadcrumb([{ label: "Home", href: "/" }, { label: "Shop", href: "/shop.html" }, { label: product.title }])}
+
+    <div class="grid-two">
+      <div>
+        <img src="${imageWebPath}" alt="${escapeHtml(product.title)}" class="product-hero"/>
+      </div>
+      <div>
+        <h1>${escapeHtml(product.title)}</h1>
+        <p>${escapeHtml(product.description)}</p>
+        <p><strong>Category:</strong> ${product.type}</p>
+        <div class="hero-actions">
+          <a class="btn primary" href="${product.etsy}" target="_blank">View on Etsy</a>
+          <a class="btn secondary" href="/shop.html">Back to Shop</a>
         </div>
       </div>
-    </section>
-    ${relatedHtml}
-  `;
+    </div>
+
+    ${related.length ? `
+    <h2 style="margin-top: 2rem;">Related Products</h2>
+    <div class="card-grid">
+      ${related
+        .map(
+          (p) => `
+      <article class="card">
+        <h3><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h3>
+        <p>${escapeHtml(p.description)}</p>
+        <a href="/products/${p.slug}.html" class="card-link">View →</a>
+      </article>`
+        )
+        .join("")}
+    </div>` : ""}
+  </div>
+</section>`;
 
   return renderLayout({
     title: `${product.title} | The Charmed Cardinal`,
     description: product.description,
     canonical: url,
     bodyHtml,
-    extraHead,
     ogImage: imageAbsUrl,
+    extraHead: `<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>`,
   });
 }
 
@@ -488,205 +412,161 @@ function renderCategoryPage({ title, slug, intro, items }) {
   const url = `${DOMAIN}/products/${slug}.html`;
 
   const bodyHtml = `
-    <section class="section">
-      <div class="container">
-        ${renderBreadcrumb([
-          { label: "Home", href: "/" },
-          { label: "Shop", href: "/shop.html" },
-          { label: title },
-        ])}
-        <h1>${escapeHtml(title)}</h1>
-        <p class="section-intro">${escapeHtml(intro)}</p>
+<section class="section">
+  <div class="container">
+    ${renderBreadcrumb([{ label: "Home", href: "/" }, { label: "Shop", href: "/shop.html" }, { label: title }])}
+    <h1>${escapeHtml(title)}</h1>
+    <p class="section-intro">${escapeHtml(intro)}</p>
 
-        <div class="card-grid">
-          ${items
-            .map(
-              (p) => `
-            <article class="card">
-              <h2><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h2>
-              <p>${escapeHtml(p.description)}</p>
-              ${renderTags(p.tags)}
-              <p>
-                <a class="card-link" href="/products/${p.slug}.html">View details →</a>
-                &nbsp;·&nbsp;
-                <a class="card-link" href="${p.etsy}" target="_blank" rel="noopener noreferrer">View on Etsy →</a>
-              </p>
-            </article>
-          `
-            )
-            .join("")}
-        </div>
-      </div>
-    </section>
-  `;
+    <div class="card-grid">
+      ${items
+        .map(
+          (p) => `
+      <article class="card">
+        <h2><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h2>
+        <p>${escapeHtml(p.description)}</p>
+        <a href="/products/${p.slug}.html" class="card-link">View →</a>
+      </article>`
+        )
+        .join("")}
+    </div>
+  </div>
+</section>
+`;
 
   return renderLayout({
-    title: `${title} | The Charmed Cardinal`,
+    title,
     description: intro,
-    canonical: url,
-  });
-}
-
-function renderShopPage(gardenFlags, digitalPatterns) {
-  const url = `${DOMAIN}/shop.html`;
-
-  const bodyHtml = `
-    <section class="section">
-      <div class="container">
-        ${renderBreadcrumb([{ label: "Home", href: "/" }, { label: "Shop" }])}
-        <h1>Shop The Charmed Cardinal</h1>
-        <p class="section-intro">
-          Browse nature-inspired garden flags and digital seamless patterns. Click any design
-          to view details, styling ideas, and a direct link to the Etsy listing.
-        </p>
-
-        <h2>Garden Flags</h2>
-        <div class="card-grid">
-          ${gardenFlags
-            .map(
-              (p) => `
-            <article class="card">
-              <h3><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h3>
-              <p>${escapeHtml(p.description)}</p>
-              ${renderTags(p.tags)}
-              <p>
-                <a class="card-link" href="/products/${p.slug}.html">View details →</a>
-                &nbsp;·&nbsp;
-                <a class="card-link" href="${p.etsy}" target="_blank" rel="noopener noreferrer">View on Etsy →</a>
-              </p>
-            </article>
-          `
-            )
-            .join("")}
-        </div>
-
-        <h2 style="margin-top:2.5rem;">Digital Seamless Patterns</h2>
-        <div class="card-grid">
-          ${digitalPatterns
-            .map(
-              (p) => `
-            <article class="card">
-              <h3><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h3>
-              <p>${escapeHtml(p.description)}</p>
-              ${renderTags(p.tags)}
-              <p>
-                <a class="card-link" href="/products/${p.slug}.html">View details →</a>
-                &nbsp;·&nbsp;
-                <a class="card-link" href="${p.etsy}" target="_blank" rel="noopener noreferrer">View on Etsy →</a>
-              </p>
-            </article>
-          `
-            )
-            .join("")}
-        </div>
-
-        <p class="section-footnote" style="margin-top:2rem;">
-          Want to see everything in one place? Visit the full Etsy shop:
-          <a href="${SHOP_URL}" target="_blank" rel="noopener noreferrer">
-            The Charmed Cardinal on Etsy
-          </a>.
-        </p>
-      </div>
-    </section>
-  `;
-
-  return renderLayout({
-    title: "Shop | The Charmed Cardinal – Garden Flags & Patterns",
-    description:
-      "Shop The Charmed Cardinal garden flags and digital seamless patterns inspired by nature, dogs, and cozy porch decor.",
     canonical: url,
     bodyHtml,
   });
 }
 
-// ----------------- Build pipeline -----------------
+function renderShopPage(flags, patterns) {
+  const url = `${DOMAIN}/shop.html`;
 
+  const bodyHtml = `
+<section class="section">
+  <div class="container">
+    ${renderBreadcrumb([{ label: "Home", href: "/" }, { label: "Shop" }])}
+    <h1>Shop The Charmed Cardinal</h1>
+    <p class="section-intro">Browse nature-inspired garden flags and digital seamless patterns.</p>
+
+    <h2>Garden Flags</h2>
+    <div class="card-grid">
+      ${flags
+        .map(
+          (p) => `
+      <article class="card">
+        <h3><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h3>
+        <p>${escapeHtml(p.description)}</p>
+        <a href="/products/${p.slug}.html" class="card-link">View →</a>
+      </article>`
+        )
+        .join("")}
+    </div>
+
+    <h2 style="margin-top:2rem;">Digital Seamless Patterns</h2>
+    <div class="card-grid">
+      ${patterns
+        .map(
+          (p) => `
+      <article class="card">
+        <h3><a href="/products/${p.slug}.html">${escapeHtml(p.title)}</a></h3>
+        <p>${escapeHtml(p.description)}</p>
+        <a href="/products/${p.slug}.html" class="card-link">View →</a>
+      </article>`
+        )
+        .join("")}
+    </div>
+  </div>
+</section>
+`;
+
+  return renderLayout({
+    title: "Shop | The Charmed Cardinal",
+    description: "Garden flags and seamless patterns, handmade with love.",
+    canonical: url,
+    bodyHtml,
+  });
+}
+
+// ---------------------------------------------
+// MAIN BUILD PIPELINE
+// ---------------------------------------------
 (async function build() {
   try {
     const outRoot = path.join(__dirname, "..");
 
-    // 1) Pull all listings from Etsy and build product objects
+    // 1. Fetch all listings
     const listingUrls = await fetchListingUrlsFromShop();
+    if (!listingUrls.length) throw new Error("No listings found.");
+
+    // 2. Fetch product details
     const products = [];
     for (const url of listingUrls) {
       try {
-        const p = await fetchListingData(url);
-        products.push(p);
+        const product = await fetchListingData(url);
+        products.push(product);
       } catch (err) {
-        console.warn(`⚠ Skipping listing due to error: ${err.message}`);
+        console.warn(`⚠ Error scraping ${url}: ${err.message}`);
       }
     }
 
-    if (!products.length) {
-      throw new Error("No products scraped from Etsy – cannot build site.");
-    }
+    if (!products.length) throw new Error("No products scraped.");
 
-    // 2) Write products.json for transparency/debugging
-    const productsJsonPath = path.join(outRoot, "data", "products.json");
+    // 3. Write products.json
     writeFile(
-      productsJsonPath,
-      JSON.stringify(
-        products.map((p) => ({
-          slug: p.slug,
-          title: p.title,
-          type: p.type,
-          description: p.description,
-          etsy: p.etsy,
-          tags: p.tags,
-        })),
-        null,
-        2
-      )
+      path.join(outRoot, "data", "products.json"),
+      JSON.stringify(products, null, 2)
     );
-    console.log(`✓ Wrote ${products.length} products to data/products.json`);
+    console.log(`✓ Wrote ${products.length} products → data/products.json`);
 
-    const gardenFlags = products.filter((p) => p.type === "garden-flag");
-    const digitalPatterns = products.filter((p) => p.type === "digital-pattern");
+    // 4. Build product pages
+    for (const p of products) {
+      const related = products.filter((x) => x.type === p.type && x.slug !== p.slug).slice(0, 3);
+      const imageInfo = await ensureProductImage(p);
 
-    // 3) Product detail pages (with image download)
-    for (const product of products) {
-      const related = products
-        .filter((p) => p.slug !== product.slug && p.type === product.type)
-        .slice(0, 3);
+      const html = renderProductPage(p, related, imageInfo);
+      const out = path.join(outRoot, "products", `${p.slug}.html`);
+      writeFile(out, html);
 
-      const imageInfo = await ensureProductImage(product);
-      const html = renderProductPage(product, related, imageInfo);
-
-      const outPath = path.join(outRoot, "products", `${product.slug}.html`);
-      writeFile(outPath, html);
-      console.log("✓ Product page:", outPath);
+      console.log("✓ Product page:", out);
     }
 
-    // 4) Category pages
-    const gardenFlagsPage = renderCategoryPage({
-      title: "Garden Flags",
-      slug: "garden-flags",
-      intro:
-        "Decorative garden flags for porches, patios, balconies, and front yards – featuring plants, dogs, kindness, and eco-friendly messages.",
-      items: gardenFlags,
-    });
-    writeFile(path.join(outRoot, "products", "garden-flags.html"), gardenFlagsPage);
-    console.log("✓ Category page: products/garden-flags.html");
+    // 5. Category pages
+    const flags = products.filter((p) => p.type === "garden-flag");
+    const patterns = products.filter((p) => p.type === "digital-pattern");
 
-    const digitalPatternsPage = renderCategoryPage({
-      title: "Digital Seamless Patterns",
-      slug: "digital-patterns",
-      intro:
-        "High-resolution seamless patterns for fabric, wrapping paper, print-on-demand products, and digital craft projects.",
-      items: digitalPatterns,
-    });
+    writeFile(
+      path.join(outRoot, "products", "garden-flags.html"),
+      renderCategoryPage({
+        title: "Garden Flags",
+        slug: "garden-flags",
+        intro: "Decorative garden flags inspired by nature, dogs, kindness, and more.",
+        items: flags,
+      })
+    );
+
     writeFile(
       path.join(outRoot, "products", "digital-patterns.html"),
-      digitalPatternsPage
+      renderCategoryPage({
+        title: "Digital Seamless Patterns",
+        slug: "digital-patterns",
+        intro: "High-resolution seamless patterns for crafting and print-on-demand.",
+        items: patterns,
+      })
     );
-    console.log("✓ Category page: products/digital-patterns.html");
 
-    // 5) Shop overview
-    const shopHtml = renderShopPage(gardenFlags, digitalPatterns);
-    writeFile(path.join(outRoot, "shop.html"), shopHtml);
-    console.log("✓ Shop page: shop.html");
+    console.log("✓ Category pages generated.");
 
-    // 6) Sitemap
+    // 6. Shop page
+    writeFile(path.join(outRoot, "shop.html"), renderShopPage(flags, patterns));
+    console.log("✓ shop.html generated.");
+
+    // 7. Sitemap
+    let sitemap = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
+
     const staticPages = [
       "",
       "about.html",
@@ -697,10 +577,6 @@ function renderShopPage(gardenFlags, digitalPatterns) {
       "products/digital-patterns.html",
     ];
 
-    let sitemap = `<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-`;
-
     staticPages.forEach((p) => {
       sitemap += `  <url><loc>${DOMAIN}/${p}</loc></url>\n`;
     });
@@ -709,12 +585,11 @@ function renderShopPage(gardenFlags, digitalPatterns) {
       sitemap += `  <url><loc>${DOMAIN}/products/${p.slug}.html</loc></url>\n`;
     });
 
-    sitemap += `</urlset>\n`;
-
+    sitemap += `</urlset>`;
     writeFile(path.join(outRoot, "sitemap.xml"), sitemap);
-    console.log("✓ Sitemap: sitemap.xml");
 
-    console.log("\n✅ Build complete.");
+    console.log("✓ sitemap.xml generated.");
+    console.log("\n✅ BUILD COMPLETE!");
   } catch (err) {
     console.error("❌ Build failed:", err);
     process.exit(1);
