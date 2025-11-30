@@ -21,7 +21,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const fetch = require("node-fetch");
+const fetch = (...args) => import("node-fetch").then(({default: fetch}) => fetch(...args));
 const xml2js = require("xml2js");
 
 const DOMAIN = "https://thecharmedcardinal.com";
