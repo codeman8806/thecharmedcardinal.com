@@ -429,8 +429,100 @@ function renderProductPage(product, imageInfo) {
       writeFile(outPath, html);
       console.log(`✓ Product page: ${product.slug}.html`);
     }
+// ------------------------------------------------------------
+// 5) Generate Homepage (index.html)
+// ------------------------------------------------------------
 
-    // 5) Sitemap
+function renderHomePage(products) {
+  const featured = products.slice(0, 6); // first 6 products
+
+  const heroHtml = `
+  <section class="hero">
+    <div class="container">
+      <h1>Handmade Garden Flags & Seamless Patterns</h1>
+      <p class="hero-subtitle">Nature-inspired decor, patterns, and handmade designs from The Charmed Cardinal.</p>
+      <div class="hero-buttons">
+        <a class="btn primary" href="/products/garden-flags.html">Shop Garden Flags</a>
+        <a class="btn secondary" href="/products/digital-patterns.html">Shop Patterns</a>
+      </div>
+    </div>
+  </section>
+  `;
+
+  const featuredHtml = `
+  <section class="section">
+    <div class="container">
+      <h2>Featured Products</h2>
+      <div class="card-grid">
+        ${featured
+          .map((p) => {
+            const img = p.imageWeb || FALLBACK_PRODUCT_IMAGE_WEB;
+            return `
+            <article class="card">
+              <a href="/products/${p.slug}.html">
+                <img src="${img}" alt="${escapeHtml(p.title)}" style="width:100%;border-radius:12px;">
+                <h3>${escapeHtml(p.title)}</h3>
+              </a>
+            </article>
+            `;
+          })
+          .join("")}
+      </div>
+    </div>
+  </section>
+  `;
+
+  const categoriesHtml = `
+  <section class="section section-alt">
+    <div class="container">
+      <h2>Browse Categories</h2>
+      <div class="grid-two">
+        <a class="category-card" href="/products/garden-flags.html">
+          🌿 Garden Flags
+        </a>
+        <a class="category-card" href="/products/digital-patterns.html">
+          🎨 Digital Patterns
+        </a>
+      </div>
+    </div>
+  </section>
+  `;
+
+  const aboutHtml = `
+  <section class="section">
+    <div class="container">
+      <h2>About The Charmed Cardinal</h2>
+      <p>The Charmed Cardinal is a handmade Etsy shop offering nature-inspired garden flags and digital seamless patterns designed with love and creativity.</p>
+      <p><a class="btn secondary" href="/about.html">Learn more →</a></p>
+    </div>
+  </section>
+  `;
+
+  const bodyHtml = heroHtml + featuredHtml + categoriesHtml + aboutHtml;
+
+  return renderLayout({
+    title: "The Charmed Cardinal | Garden Flags & Patterns",
+    description:
+      "Handmade garden flags, digital seamless patterns, porch decor, and nature-inspired designs from The Charmed Cardinal Etsy shop.",
+    canonical: `${DOMAIN}/`,
+    bodyHtml,
+    ogImage: `${DOMAIN}/assets/og-image.jpg`,
+  });
+}
+
+// After generating product pages, add this section:
+
+console.log("✓ Generating homepage index.html...");
+const homepageHtml = renderHomePage(
+  products.map((p) => ({
+    ...p,
+    imageWeb: `/assets/products/${p.slug}.jpg`, // fallback guess, adjusted later
+  }))
+);
+writeFile(path.join(outRoot, "index.html"), homepageHtml);
+console.log("✓ Homepage: index.html");
+
+    // 6) Sitemap
     let sitemap = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
 
     const staticPages = [
