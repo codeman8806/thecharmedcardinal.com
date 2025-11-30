@@ -66,6 +66,15 @@ async function fetchHtml(url) {
         "AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/120.0.0.0 Safari/537.36"
     );
+await page.setCookie(
+  { name: "uaid", value: "1234567890", domain: ".etsy.com" },
+  { name: "ua_session_id", value: "abcdef123456", domain: ".etsy.com" },
+  { name: "country", value: "US", domain: ".etsy.com" },
+  { name: "region", value: "CO", domain: ".etsy.com" },
+  { name: "currency", value: "USD", domain: ".etsy.com" },
+  { name: "is_gdpr_country", value: "0", domain: ".etsy.com" },
+  { name: "user_prefs", value: "cNYAAAE", domain: ".etsy.com" }
+);
 
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
     const html = await page.content();
