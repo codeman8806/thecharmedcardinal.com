@@ -1,6 +1,9 @@
 /********************************************************************
- * The Charmed Cardinal — Static Site Builder
- * Etsy RSS → Product Pages → Category Pages → Sitemap
+ * The Charmed Cardinal — Static Site Builder (RSS + Puppeteer)
+ * - Uses Etsy RSS for titles & descriptions
+ * - Cleans description (strip HTML, decode entities)
+ * - Uses Puppeteer ONLY for og:image
+ * - Generates product pages + sitemap
  ********************************************************************/
 
 const fs = require("fs");
@@ -65,11 +68,53 @@ function downloadBinary(url, destPath) {
   });
 }
 
+// Strip HTML tags + decode some basic entities + trim + collapse whitespace
+function cleanDescription(html = "") {
+  let text = String(html);
+
+  // Strip tags
+  text = text.replace(/<\/?[^>]+>/g, " ");
+
+  // Decode common entities
+  text = text
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+
+  // Collapse whitespace
+  text = text.replace(/\s+/g, " ").trim();
+
+  // Optional: limit length a bit for meta description
+  if (text.length > 320) {
+    text = text.slice(0, 317).trimEnd() + "...";
+  }
+
+  return text;
+}
+
+function slugFromTitleAndId(title, id) {
+  const base = String(title)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${base || "product"}-${id}`;
+}
+
+function inferType(title, desc) {
+  const t = (title + " " + desc).toLowerCase();
+  if (t.includes("pattern") || t.includes("seamless")) return "digital-pattern";
+  if (t.includes("flag")) return "garden-flag";
+  return "garden-flag";
+}
+
 // ------------------------------------------------------------
-// 1) FETCH LISTINGS FROM RSS (bulletproof & no blocking)
+// 1) FETCH LISTINGS FROM RSS WITH TITLES + DESCRIPTIONS
 // ------------------------------------------------------------
 
-async function fetchListingUrlsFromRSS() {
+async function fetchListingsFromRSS() {
   console.log(`→ Fetching Etsy RSS: ${RSS_URL}`);
 
   return new Promise((resolve, reject) => {
@@ -80,17 +125,31 @@ async function fetchListingUrlsFromRSS() {
 
       let xml = "";
       res.on("data", (chunk) => (xml += chunk));
-      res.on("end", async () => {
+      res.on("end", () => {
         xml2js.parseString(xml, (err, result) => {
           if (err) return reject(err);
 
           const items = result?.rss?.channel?.[0]?.item || [];
-          const urls = items
-            .map((item) => item.link?.[0])
+          const listings = items
+            .map((item) => {
+              const url = item.link?.[0];
+              const rawTitle = item.title?.[0] || "";
+              const rawDesc = item.description?.[0] || "";
+              if (!url) return null;
+
+              const idMatch = url.match(/listing\/(\d+)/);
+              const id = idMatch ? idMatch[1] : Date.now().toString();
+
+              const title = rawTitle.trim();
+              const description = cleanDescription(rawDesc);
+              const type = inferType(title, description);
+
+              return { url, id, title, description, type };
+            })
             .filter(Boolean);
 
-          console.log(`✓ Found ${urls.length} listings via RSS`);
-          resolve(urls);
+          console.log(`✓ Found ${listings.length} listings via RSS`);
+          resolve(listings);
         });
       });
     });
@@ -98,11 +157,19 @@ async function fetchListingUrlsFromRSS() {
 }
 
 // ------------------------------------------------------------
-// 2) Fetch OG tags from each listing (Puppeteer)
+// 2) Puppeteer: fetch only og:image for each listing
 // ------------------------------------------------------------
 
-async function fetchListingData(listingUrl, browser) {
-  console.log(`→ Scraping listing: ${listingUrl}`);
+async function createBrowser() {
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+  return browser;
+}
+
+async function fetchOgImageForListing(listing, browser) {
+  console.log(`→ Getting og:image for: ${listing.url}`);
 
   const page = await browser.newPage();
   await page.setUserAgent(
@@ -110,50 +177,25 @@ async function fetchListingData(listingUrl, browser) {
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   );
 
-  await page.goto(listingUrl, { waitUntil: "networkidle2", timeout: 60000 });
+  try {
+    await page.goto(listing.url, { waitUntil: "networkidle2", timeout: 60000 });
 
-  const og = await page.evaluate(() => {
-    const get = (name, attr = "property") =>
-      document.querySelector(`meta[${attr}="${name}"]`)?.content || null;
+    const ogImage = await page.evaluate(() => {
+      const tag = document.querySelector('meta[property="og:image"]');
+      return tag ? tag.content : null;
+    });
 
-    return {
-      title: get("og:title")?.replace(/ - Etsy$/, "") || "Untitled Product",
-      description: get("og:description") || "",
-      image: get("og:image"),
-    };
-  });
-
-  await page.close();
-
-  // Extract ID
-  const id = listingUrl.match(/listing\/(\d+)/)?.[1] || Date.now();
-
-  // Infer product type
-  const text = `${og.title} ${og.description}`.toLowerCase();
-  let type = "garden-flag";
-  if (text.includes("pattern") || text.includes("seamless")) type = "digital-pattern";
-
-  // Create slug
-  const base = og.title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  const slug = `${base}-${id}`;
-
-  return {
-    id,
-    slug,
-    title: og.title,
-    description: og.description,
-    etsy: listingUrl,
-    type,
-    tags: [],
-    ogImageUrl: og.image,
-  };
+    return ogImage || null;
+  } catch (err) {
+    console.warn(`⚠ Failed to get og:image for ${listing.url}: ${err.message}`);
+    return null;
+  } finally {
+    await page.close();
+  }
 }
 
 // ------------------------------------------------------------
-// Download product images
+// Download product image
 // ------------------------------------------------------------
 
 async function ensureProductImage(product) {
@@ -163,78 +205,110 @@ async function ensureProductImage(product) {
   if (!product.ogImageUrl) return null;
 
   let ext = "jpg";
-  if (product.ogImageUrl.includes(".png")) ext = "png";
-  if (product.ogImageUrl.includes(".webp")) ext = "webp";
+  const lower = product.ogImageUrl.toLowerCase();
+  if (lower.includes(".png")) ext = "png";
+  else if (lower.includes(".jpeg")) ext = "jpeg";
+  else if (lower.includes(".webp")) ext = "webp";
 
-  const file = `${product.slug}.${ext}`;
-  const destPath = path.join(dir, file);
+  const filename = `${product.slug}.${ext}`;
+  const destPath = path.join(dir, filename);
 
   if (!fileExists(destPath)) {
-    console.log(`→ Downloading product image: ${product.ogImageUrl}`);
-    await downloadBinary(product.ogImageUrl, destPath);
+    console.log(`→ Downloading image: ${product.ogImageUrl}`);
+    try {
+      await downloadBinary(product.ogImageUrl, destPath);
+    } catch (err) {
+      console.warn(`⚠ Failed to download image: ${err.message}`);
+      return null;
+    }
   }
 
   return {
-    webPath: `/assets/products/${file}`,
-    absUrl: `${DOMAIN}/assets/products/${file}`,
+    webPath: `/assets/products/${filename}`,
+    absUrl: `${DOMAIN}/assets/products/${filename}`,
   };
 }
 
 // ------------------------------------------------------------
-// Render layout helpers (unchanged from your version)
+// Rendering helpers
 // ------------------------------------------------------------
 
 function renderLayout({ title, description, canonical, bodyHtml, extraHead = "", ogImage }) {
   const safeTitle = escapeHtml(title);
-  const safeDesc = escapeHtml(description);
+  const safeDesc = escapeHtml(description || "");
+  const og = ogImage || DEFAULT_OG_IMAGE;
 
   return `<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<title>${safeTitle}</title>
-<meta name="description" content="${safeDesc}">
-<link rel="canonical" href="${canonical}">
-<link rel="stylesheet" href="/styles.css">
-<link rel="icon" href="/assets/favicon.png">
+  <meta charset="utf-8" />
+  <title>${safeTitle}</title>
+  <meta name="description" content="${safeDesc}">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="canonical" href="${canonical}" />
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" type="image/png" href="/assets/favicon.png" />
 
-<meta property="og:title" content="${safeTitle}">
-<meta property="og:description" content="${safeDesc}">
-<meta property="og:image" content="${ogImage}">
-<meta property="og:type" content="website">
+  <meta property="og:title" content="${safeTitle}" />
+  <meta property="og:description" content="${safeDesc}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="${canonical}" />
+  <meta property="og:image" content="${og}" />
 
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="${safeTitle}">
-<meta name="twitter:image" content="${ogImage}">
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${safeTitle}" />
+  <meta name="twitter:description" content="${safeDesc}" />
+  <meta name="twitter:image" content="${og}" />
 
-${extraHead}
+  ${extraHead}
 </head>
 <body>
-${bodyHtml}
+  <header class="site-header">
+    <div class="container header-inner">
+      <a href="/" class="brand">
+        <span class="brand-mark">🕊️</span>
+        <span class="brand-text">
+          <span class="brand-name">The Charmed Cardinal</span>
+          <span class="brand-tagline">Garden Flags & Seamless Patterns</span>
+        </span>
+      </a>
+      <nav class="main-nav">
+        <a href="/">Home</a>
+        <a href="/shop.html">Shop</a>
+        <a href="/about.html">About</a>
+        <a href="/blog/">Blog</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    ${bodyHtml}
+  </main>
+
+  <footer class="site-footer">
+    <p style="text-align:center;">&copy; ${new Date().getFullYear()} The Charmed Cardinal</p>
+  </footer>
 </body>
 </html>`;
 }
 
 function renderBreadcrumb(items) {
-  return items
+  return `
+<nav class="breadcrumbs">
+  ${items
     .map((item, i) =>
-      i === items.length - 1
-        ? `<span>${escapeHtml(item.label)}</span>`
-        : `<a href="${item.href}">${escapeHtml(item.label)}</a> &raquo; `
+      item.href && i < items.length - 1
+        ? `<a href="${item.href}">${escapeHtml(item.label)}</a> &raquo; `
+        : `<span>${escapeHtml(item.label)}</span>`
     )
-    .join("");
+    .join("")}
+</nav>`;
 }
 
-// ------------------------------------------------------------
-// Category + product page rendering
-// (unchanged except for minor whitespace adjustments)
-// ------------------------------------------------------------
-
-function renderProductPage(product, related, imageInfo) {
+function renderProductPage(product, imageInfo) {
+  const canonical = `${DOMAIN}/products/${product.slug}.html`;
   const imageAbs = imageInfo?.absUrl || DEFAULT_OG_IMAGE;
   const imageWeb = imageInfo?.webPath || FALLBACK_PRODUCT_IMAGE_WEB;
-
-  const canonical = `${DOMAIN}/products/${product.slug}.html`;
 
   const jsonLd = {
     "@context": "https://schema.org",
@@ -244,25 +318,54 @@ function renderProductPage(product, related, imageInfo) {
     description: product.description,
     brand: { "@type": "Brand", name: "The Charmed Cardinal" },
     url: canonical,
-    offers: { "@type": "Offer", url: product.etsy, availability: "InStock" },
+    offers: {
+      "@type": "Offer",
+      url: product.etsy,
+      availability: "https://schema.org/InStock",
+    },
   };
 
   const bodyHtml = `
+<section class="section">
   <div class="container">
-    ${renderBreadcrumb([{ label: "Home", href: "/" }, { label: "Shop", href: "/shop.html" }, { label: product.title }])}
-    <h1>${escapeHtml(product.title)}</h1>
-    <img src="${imageWeb}" style="width:100%;max-width:500px;border-radius:18px;">
-    <p>${escapeHtml(product.description)}</p>
-    <a class="btn" href="${product.etsy}" target="_blank">View on Etsy</a>
-  </div>`;
+    ${renderBreadcrumb([
+      { label: "Home", href: "/" },
+      { label: "Shop", href: "/shop.html" },
+      { label: product.title },
+    ])}
+
+    <div class="grid-two">
+      <div>
+        <img src="${imageWeb}" alt="${escapeHtml(
+    product.title
+  )}" style="width:100%;max-width:480px;border-radius:18px;box-shadow:0 10px 25px rgba(15,23,42,0.15);" />
+      </div>
+      <div>
+        <h1>${escapeHtml(product.title)}</h1>
+        <p>${escapeHtml(product.description)}</p>
+        <p><strong>Category:</strong> ${
+          product.type === "digital-pattern" ? "Digital Seamless Pattern" : "Garden Flag"
+        }</p>
+        <div class="hero-actions">
+          <a class="btn primary" href="${product.etsy}" target="_blank" rel="noopener noreferrer">
+            View on Etsy
+          </a>
+          <a class="btn secondary" href="/shop.html">Back to shop</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>`;
 
   return renderLayout({
-    title: product.title,
+    title: `${product.title} | The Charmed Cardinal`,
     description: product.description,
     canonical,
     bodyHtml,
     ogImage: imageAbs,
-    extraHead: `<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>`,
+    extraHead: `<script type="application/ld+json">${JSON.stringify(
+      jsonLd
+    )}</script>`,
   });
 }
 
@@ -272,21 +375,36 @@ function renderProductPage(product, related, imageInfo) {
 
 (async function build() {
   try {
+    const outRoot = path.join(__dirname, "..");
+
+    // 1) RSS listings with titles + descriptions
     console.log("→ Fetching listing list via RSS…");
-    const listingUrls = await fetchListingUrlsFromRSS();
+    const rssListings = await fetchListingsFromRSS();
+    if (!rssListings.length) throw new Error("No listings found in RSS!");
 
-    if (!listingUrls.length) throw new Error("No listings found!");
-
-    const browser = await puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    });
-
+    // 2) Puppeteer for og:image only
+    const browser = await createBrowser();
     const products = [];
-    for (const url of listingUrls) {
+
+    for (const listing of rssListings) {
       try {
-        const p = await fetchListingData(url, browser);
-        products.push(p);
+        const ogImageUrl = await fetchOgImageForListing(listing, browser);
+
+        const slug = slugFromTitleAndId(listing.title, listing.id);
+        const product = {
+          id: listing.id,
+          slug,
+          title: listing.title || "Untitled Product",
+          description:
+            listing.description ||
+            "A handmade design from The Charmed Cardinal Etsy shop.",
+          etsy: listing.url,
+          type: listing.type,
+          tags: [],
+          ogImageUrl,
+        };
+
+        products.push(product);
       } catch (err) {
         console.warn(`⚠ Failed listing scrape: ${err.message}`);
       }
@@ -294,35 +412,48 @@ function renderProductPage(product, related, imageInfo) {
 
     await browser.close();
 
-    // Save products.json
+    if (!products.length) throw new Error("No products built.");
+
+    // 3) Save products.json
     writeFile(
-      path.join(__dirname, "..", "data", "products.json"),
+      path.join(outRoot, "data", "products.json"),
       JSON.stringify(products, null, 2)
     );
     console.log(`✓ Saved ${products.length} products → data/products.json`);
 
-    // Download images & build pages
+    // 4) Download images + generate product pages
     for (const product of products) {
       const imageInfo = await ensureProductImage(product);
-      const html = renderProductPage(product, [], imageInfo);
-
-      writeFile(
-        path.join(__dirname, "..", "products", `${product.slug}.html`),
-        html
-      );
+      const html = renderProductPage(product, imageInfo);
+      const outPath = path.join(outRoot, "products", `${product.slug}.html`);
+      writeFile(outPath, html);
       console.log(`✓ Product page: ${product.slug}.html`);
     }
 
-    // Build sitemap
+    // 5) Sitemap
     let sitemap = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
-    for (const p of products) {
-      sitemap += `<url><loc>${DOMAIN}/products/${p.slug}.html</loc></url>\n`;
-    }
-    sitemap += `</urlset>`;
-    writeFile(path.join(__dirname, "..", "sitemap.xml"), sitemap);
 
-    console.log("\n✅ BUILD COMPLETE — your site is fully generated.");
+    const staticPages = [
+      "",
+      "about.html",
+      "shop.html",
+      "blog/",
+      "blog/style-your-porch-with-garden-flags.html",
+    ];
 
+    staticPages.forEach((p) => {
+      sitemap += `  <url><loc>${DOMAIN}/${p}</loc></url>\n`;
+    });
+
+    products.forEach((p) => {
+      sitemap += `  <url><loc>${DOMAIN}/products/${p.slug}.html</loc></url>\n`;
+    });
+
+    sitemap += `</urlset>\n`;
+    writeFile(path.join(outRoot, "sitemap.xml"), sitemap);
+    console.log("✓ sitemap.xml built.");
+
+    console.log("\n✅ BUILD COMPLETE — titles + descriptions are now from RSS and cleaned.");
   } catch (err) {
     console.error("❌ Build failed:", err);
     process.exit(1);
