@@ -28,8 +28,7 @@ function writeFile(p, contents) {
 
 function fileExists(p) {
   try {
-    fs.accessSync(p, fs.constants.F_O
-K);
+    fs.accessSync(p, fs.constants.F_OK);
     return true;
   } catch {
     return false;
