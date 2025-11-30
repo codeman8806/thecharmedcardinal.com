@@ -1,309 +1,631 @@
-/**
- * build.js — Full Site Generator for The Charmed Cardinal
- * Generates:
- *  - products.json (already created)
- *  - product pages
- *  - shop.html
- *  - category pages
- *  - homepage with featured products
- *  - sitemap.xml
- */
+// scripts/build.js
+// Build static product pages for thecharmedcardinal.com from Etsy RSS.
 
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const Parser = require("rss-parser");
-const parser = new Parser();
 
-// OUTPUT PATHS
-const DATA_DIR = "data";
-const PRODUCTS_JSON = path.join(DATA_DIR, "products.json");
-const ASSETS_DIR = "assets/products";
+const DOMAIN = "https://thecharmedcardinal.com";
+const SHOP_URL = "https://www.etsy.com/shop/thecharmedcardinal";
+const RSS_URL = `${SHOP_URL}/rss`;
 
-// Ensure directories
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
-if (!fs.existsSync("assets")) fs.mkdirSync("assets");
-if (!fs.existsSync(ASSETS_DIR)) fs.mkdirSync(ASSETS_DIR);
+const OUT_ROOT = path.join(__dirname, "..");
+const ASSET_PRODUCT_DIR = path.join(OUT_ROOT, "assets", "products");
+const DATA_DIR = path.join(OUT_ROOT, "data");
 
-function escapeHtml(str) {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+// ----------------- Small helpers -----------------
+
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
 }
 
-// ------------------------------
-// Download image helper
-// ------------------------------
-function downloadImage(url, dest) {
+function writeFile(p, contents) {
+  ensureDir(path.dirname(p));
+  fs.writeFileSync(p, contents);
+}
+
+function escapeHtml(str = "") {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Decode a few common HTML entities coming from RSS
+function decodeEntities(str = "") {
+  return String(str)
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function truncate(str = "", max = 140) {
+  const s = String(str).trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max).replace(/\s+\S*$/, "") + "…";
+}
+
+// Very simple "guess" for type from title/description
+function inferType(title, description) {
+  const t = (title + " " + description).toLowerCase();
+  if (t.includes("pattern")) return "digital-pattern";
+  if (t.includes("seamless")) return "digital-pattern";
+  return "garden-flag";
+}
+
+function slugFromTitleAndId(title, id) {
+  const base = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${base || "product"}-${id}`;
+}
+
+function extractPrice(description = "") {
+  const m = description.match(/(\d+(?:\.\d{2})?)\s*USD/i);
+  if (!m) return null;
+  return `${m[1]} USD`;
+}
+
+function stripLeadingPrice(description = "") {
+  return description.replace(/^\s*\d+(?:\.\d{2})?\s*USD\s*/i, "").trim();
+}
+
+// Download binary file (image) to destPath
+function downloadBinary(url, destPath) {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
+    ensureDir(path.dirname(destPath));
+
     https
-      .get(url, (response) => {
-        if (response.statusCode !== 200) {
-          return reject(`Image download failed ${url} (status ${response.statusCode})`);
+      .get(url, (res) => {
+        if (
+          res.statusCode >= 300 &&
+          res.statusCode < 400 &&
+          res.headers.location
+        ) {
+          res.resume();
+          return resolve(downloadBinary(res.headers.location, destPath));
         }
-        response.pipe(file);
-        file.on("finish", () => resolve());
+
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(
+            new Error(`Image download failed: ${res.statusCode} for ${url}`)
+          );
+        }
+
+        const fileStream = fs.createWriteStream(destPath);
+        res.pipe(fileStream);
+        fileStream.on("finish", () => {
+          fileStream.close(() => resolve(destPath));
+        });
       })
       .on("error", reject);
   });
 }
 
-// ------------------------------
-// Product Card Component
-// ------------------------------
-function productCard(p) {
-  return `
-  <article class="card">
-    <a href="/products/${p.slug}.html" class="thumb">
-        <img src="/assets/products/${p.slug}.jpg" alt="${escapeHtml(p.shortTitle)}" loading="lazy">
-    </a>
+// ----------------- RSS → product objects -----------------
 
-    <h3 class="card-title">
-      <a href="/products/${p.slug}.html">${escapeHtml(p.shortTitle)}</a>
-    </h3>
+async function fetchRssItems() {
+  const parser = new Parser({
+    customFields: {
+      item: ["content:encoded", "media:content"],
+    },
+  });
 
-    <p class="card-price">${p.price}</p>
-
-    <p class="card-desc">${escapeHtml(p.description.slice(0, 120))}...</p>
-
-    <a class="card-link" href="/products/${p.slug}.html">View details →</a>
-  </article>
-  `;
+  console.log(`→ Fetching Etsy RSS: ${RSS_URL}`);
+  const feed = await parser.parseURL(RSS_URL);
+  console.log(`✓ RSS items found: ${feed.items.length}`);
+  return feed.items;
 }
 
-// ------------------------------
-// PAGE WRAPPER LAYOUT
-// ------------------------------
-function layoutPage(title, body) {
-  return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>${escapeHtml(title)}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
+function extractImageUrlFromItem(item) {
+  // 1) enclosure
+  if (item.enclosure && item.enclosure.url) return item.enclosure.url;
 
-<header class="site-header">
-  <h1><a href="/">The Charmed Cardinal</a></h1>
-  <nav>
-    <a href="/shop.html">Shop</a>
-    <a href="/about.html">About</a>
-    <a href="/blog/">Blog</a>
-    <a href="/contact.html">Contact</a>
-  </nav>
-</header>
+  // 2) media:content (rss-parser may map it oddly, so fall back to raw fields)
+  const mc = item["media:content"];
+  if (mc && mc.$ && mc.$.url) return mc.$.url;
 
-<main>${body}</main>
+  // 3) look inside encoded HTML for an Etsy static image
+  const html = item["content:encoded"] || item.content || "";
+  const m = html.match(/https:\/\/i\.etsystatic\.com\/[^"']+\.jpg/i);
+  if (m) return m[0];
 
-<footer>&copy; 2025 The Charmed Cardinal</footer>
-
-</body>
-</html>
-`;
+  return null;
 }
 
-// ------------------------------
-// INDIVIDUAL PRODUCT PAGE
-// ------------------------------
-function generateProductPage(p) {
-  const html = layoutPage(
-    p.title,
-    `
-    <div class="product-page">
-      <div class="product-image">
-        <img src="/assets/products/${p.slug}.jpg" alt="${escapeHtml(p.title)}">
-      </div>
+function buildProductsFromRss(items) {
+  const products = [];
 
-      <div class="product-info">
-        <h2>${escapeHtml(p.title)}</h2>
+  items.forEach((item, idx) => {
+    const link = item.link || "";
+    const idMatch = link.match(/\/listing\/(\d+)/);
+    const id = idMatch ? idMatch[1] : String(idx + 1);
 
-        <p class="price">${p.price}</p>
+    const rawTitle = decodeEntities(item.title || "Untitled product");
+    const rawDescription = decodeEntities(
+      item.contentSnippet || item.content || ""
+    );
 
-        <p>${escapeHtml(p.description)}</p>
+    const price = extractPrice(rawDescription);
+    const descriptionBody = stripLeadingPrice(rawDescription);
+    const description =
+      descriptionBody ||
+      "A handcrafted design from The Charmed Cardinal on Etsy.";
 
-        <p><strong>Category:</strong> ${p.category}</p>
+    const type = inferType(rawTitle, description);
+    const slug = slugFromTitleAndId(rawTitle, id);
+    const imageRemote = extractImageUrlFromItem(item);
 
-        <a href="${p.url}" class="etsy-btn" target="_blank">View on Etsy →</a>
-        <p><a href="/shop.html">← Back to shop</a></p>
-      </div>
-    </div>
-    `
-  );
-
-  const filePath = `products/${p.slug}.html`;
-  fs.writeFileSync(filePath, html);
-  console.log("✓ Product page:", filePath);
-}
-
-// ------------------------------
-// SHOP PAGE
-// ------------------------------
-function generateShopPage(products) {
-  const flags = products.filter((p) => p.category === "Garden Flag");
-  const patterns = products.filter((p) => p.category === "Digital Pattern");
-
-  const html = layoutPage(
-    "Shop The Charmed Cardinal",
-    `
-    <h2>Shop The Charmed Cardinal</h2>
-    <p>Browse nature-inspired garden flags and digital print patterns.</p>
-
-    <h3>Garden Flags</h3>
-    <div class="card-grid">
-      ${flags.map(productCard).join("")}
-    </div>
-
-    <h3>Digital Patterns</h3>
-    <div class="card-grid">
-      ${patterns.map(productCard).join("")}
-    </div>
-    `
-  );
-
-  fs.writeFileSync("shop.html", html);
-  console.log("✓ Shop page");
-}
-
-// ------------------------------
-// CATEGORY PAGE
-// ------------------------------
-function generateCategoryPage(products, categoryName, fileName) {
-  const html = layoutPage(
-    categoryName,
-    `
-    <h2>${escapeHtml(categoryName)}</h2>
-
-    <div class="card-grid">
-      ${products.map(productCard).join("")}
-    </div>
-    `
-  );
-
-  fs.writeFileSync(`products/${fileName}`, html);
-  console.log("✓ Category page:", fileName);
-}
-
-// ------------------------------
-// HOMEPAGE
-// ------------------------------
-function generateHomePage(products) {
-  const featured = products.slice(0, 6);
-
-  const html = layoutPage(
-    "The Charmed Cardinal",
-    `
-    <h2>Welcome to The Charmed Cardinal</h2>
-    <p>Explore handcrafted garden flags and digital art patterns.</p>
-
-    <h3>Featured Products</h3>
-    <div class="card-grid">
-      ${featured.map(productCard).join("")}
-    </div>
-
-    <p style="margin-top:20px;"><a href="/shop.html">View all →</a></p>
-    `
-  );
-
-  fs.writeFileSync("index.html", html);
-  console.log("✓ Homepage");
-}
-
-// ------------------------------
-// SITEMAP
-// ------------------------------
-function generateSitemap(products) {
-  const urls = [
-    "https://thecharmedcardinal.com/",
-    "https://thecharmedcardinal.com/shop.html",
-    "https://thecharmedcardinal.com/products/garden-flags.html",
-    "https://thecharmedcardinal.com/products/digital-patterns.html",
-    ...products.map((p) => `https://thecharmedcardinal.com/products/${p.slug}.html`),
-  ];
-
-  const xml = `
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urls.map((u) => `<url><loc>${u}</loc></url>`).join("")}
-</urlset>`;
-
-  fs.writeFileSync("sitemap.xml", xml);
-  console.log("✓ Sitemap");
-}
-
-// ------------------------------
-// MAIN BUILD — uses Etsy RSS only
-// ------------------------------
-async function build() {
-  console.log("\n🚀 BUILD START\n");
-
-  console.log("→ Fetching Etsy RSS...");
-  const feed = await parser.parseURL("https://www.etsy.com/shop/thecharmedcardinal/rss");
-
-  const products = feed.items.map((item) => {
-    const slug = item.link
-      .replace("https://www.etsy.com/listing/", "")
-      .replace(/\?.*/, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-");
-
-    return {
-      title: item.title,
-      shortTitle: item.title.replace(/ by TheCharmedCardinal/i, ""),
-      description: item.contentSnippet || "",
-      price: item.title.match(/\$?[0-9]+\.[0-9]{2}/)?.[0] || "",
-      category: item.title.includes("Flag") ? "Garden Flag" : "Digital Pattern",
-      url: item.link,
+    products.push({
+      id,
       slug,
-      image: item.enclosure?.url || null,
-    };
+      title: rawTitle,
+      description,
+      price,
+      etsy: link || SHOP_URL,
+      type,
+      tags: [],
+      imageRemote,
+      imageWebPath: null,
+      imageAbsUrl: null,
+    });
   });
 
   console.log(`✓ Parsed products from RSS: ${products.length}`);
-
-  // Download images
-  for (const p of products) {
-    if (p.image) {
-      const dest = `${ASSETS_DIR}/${p.slug}.jpg`;
-      if (!fs.existsSync(dest)) {
-        console.log(`→ Downloading image for "${p.shortTitle}"`);
-        try {
-          await downloadImage(p.image, dest);
-        } catch (e) {
-          console.log("❌ Image download failed:", e);
-        }
-      }
-    }
-  }
-
-  // Save JSON
-  fs.writeFileSync(PRODUCTS_JSON, JSON.stringify(products, null, 2));
-  console.log("✓ Saved products.json");
-
-  // Generate pages
-  products.forEach(generateProductPage);
-
-  generateCategoryPage(
-    products.filter((p) => p.category === "Garden Flag"),
-    "Garden Flags",
-    "garden-flags.html"
-  );
-
-  generateCategoryPage(
-    products.filter((p) => p.category === "Digital Pattern"),
-    "Digital Patterns",
-    "digital-patterns.html"
-  );
-
-  generateShopPage(products);
-  generateHomePage(products);
-  generateSitemap(products);
-
-  console.log("\n✅ BUILD COMPLETE\n");
+  return products;
 }
 
-build();
+// Download each product's image into assets/products and attach paths
+async function hydrateProductImages(products) {
+  ensureDir(ASSET_PRODUCT_DIR);
+
+  for (const p of products) {
+    if (!p.imageRemote) {
+      console.warn(`⚠ No image URL for "${p.title}"`);
+      continue;
+    }
+
+    // Use JPG; Etsy’s URLs are JPG in practice
+    const filename = `${p.slug}.jpg`;
+    const destPath = path.join(ASSET_PRODUCT_DIR, filename);
+
+    if (!fs.existsSync(destPath)) {
+      console.log(`→ Downloading image for "${p.title}": ${p.imageRemote}`);
+      try {
+        await downloadBinary(p.imageRemote, destPath);
+      } catch (err) {
+        console.warn(
+          `⚠ Failed to download image for "${p.title}": ${err.message}`
+        );
+        continue;
+      }
+    }
+
+    const webPath = `/assets/products/${filename}`;
+    p.imageWebPath = webPath;
+    p.imageAbsUrl = `${DOMAIN}${webPath}`;
+  }
+}
+
+// ----------------- Layout + UI helpers -----------------
+
+function renderLayout({ title, description, bodyHtml, canonical }) {
+  const safeTitle = escapeHtml(title);
+  const safeDesc = escapeHtml(description);
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>${safeTitle}</title>
+  <meta name="description" content="${safeDesc}" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="canonical" href="${canonical}" />
+
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" type="image/png" href="/assets/favicon.png" />
+
+  <meta property="og:title" content="${safeTitle}" />
+  <meta property="og:description" content="${safeDesc}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="${canonical}" />
+  <meta property="og:image" content="${DOMAIN}/assets/og-image.png" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="logo-wrap">
+      <a href="/" class="logo-link">
+        <img src="/assets/favicon.png" alt="The Charmed Cardinal logo" class="logo-img" />
+        <span class="logo-text">
+          <span class="logo-title">The Charmed Cardinal</span>
+          <span class="logo-tagline">Garden Flags &amp; Seamless Patterns</span>
+        </span>
+      </a>
+    </div>
+    <nav class="site-nav">
+      <a href="/">Home</a>
+      <a href="/shop.html">Shop</a>
+      <a href="/about.html">About</a>
+      <a href="/blog/">Blog</a>
+      <a href="/index.html#contact">Contact</a>
+    </nav>
+  </header>
+
+  <main>
+${bodyHtml}
+  </main>
+
+  <footer class="site-footer">
+    <p>&copy; ${new Date().getFullYear()} The Charmed Cardinal</p>
+  </footer>
+</body>
+</html>`;
+}
+
+function renderBreadcrumb(items) {
+  return `
+  <nav class="breadcrumb" aria-label="Breadcrumb">
+    ${items
+      .map((item, idx) => {
+        if (!item.href || idx === items.length - 1) {
+          return `<span>${escapeHtml(item.label)}</span>`;
+        }
+        return `<a href="${item.href}">${escapeHtml(item.label)}</a> &raquo; `;
+      })
+      .join("")}
+  </nav>`;
+}
+
+function renderProductCard(product) {
+  const href = `/products/${product.slug}.html`;
+  const title = escapeHtml(product.title);
+  const desc = escapeHtml(truncate(product.description, 140));
+  const priceHtml = product.price
+    ? `<div class="card-price">${escapeHtml(product.price)}</div>`
+    : "";
+
+  const imgSrc =
+    product.imageWebPath || "/assets/og-image.png"; // defensive fallback
+
+  return `
+  <article class="card">
+    <a href="${href}" class="card-link-wrap">
+      <div class="thumb">
+        <img src="${imgSrc}" alt="${title}" loading="lazy" />
+      </div>
+    </a>
+    <div class="card-body">
+      <h3 class="card-title"><a href="${href}">${title}</a></h3>
+      ${priceHtml}
+      <p class="card-desc">${desc}</p>
+      <a class="card-link" href="${href}">View details →</a>
+    </div>
+  </article>`;
+}
+
+// ----------------- Page renderers -----------------
+
+function renderProductPage(product) {
+  const url = `${DOMAIN}/products/${product.slug}.html`;
+
+  const imgSrc =
+    product.imageWebPath || "/assets/og-image.png";
+
+  const priceHtml = product.price
+    ? `<p class="price">${escapeHtml(product.price)}</p>`
+    : "";
+
+  const typeLabel =
+    product.type === "digital-pattern" ? "Digital Pattern" : "Garden Flag / Outdoor Decor";
+
+  const bodyHtml = `
+  <section>
+    ${renderBreadcrumb([
+      { label: "Home", href: "/" },
+      { label: "Shop", href: "/shop.html" },
+      {
+        label:
+          product.type === "digital-pattern"
+            ? "Digital Patterns"
+            : "Garden Flags",
+        href:
+          product.type === "digital-pattern"
+            ? "/products/digital-patterns.html"
+            : "/products/garden-flags.html",
+      },
+      { label: product.title },
+    ])}
+    <div class="product-page">
+      <div class="product-image">
+        <img src="${imgSrc}" alt="${escapeHtml(product.title)}" />
+      </div>
+      <div class="product-info">
+        <h1>${escapeHtml(product.title)}</h1>
+        ${priceHtml}
+        <p>${escapeHtml(product.description)}</p>
+        <p><strong>Category:</strong> ${escapeHtml(typeLabel)}</p>
+        <a href="${product.etsy}" target="_blank" rel="noopener noreferrer" class="etsy-btn">
+          View on Etsy →
+        </a>
+        <p style="margin-top: 10px;">
+          <a href="/shop.html">← Back to shop</a>
+        </p>
+      </div>
+    </div>
+  </section>`;
+
+  return renderLayout({
+    title: `${product.title} | The Charmed Cardinal`,
+    description: product.description,
+    bodyHtml,
+    canonical: url,
+  });
+}
+
+function renderCategoryPage({ title, slug, intro, items }) {
+  const url = `${DOMAIN}/products/${slug}.html`;
+  const cardsHtml = items.map(renderProductCard).join("");
+
+  const bodyHtml = `
+  <section>
+    ${renderBreadcrumb([
+      { label: "Home", href: "/" },
+      { label: "Shop", href: "/shop.html" },
+      { label: title },
+    ])}
+    <h1>${escapeHtml(title)}</h1>
+    <p class="section-intro">${escapeHtml(intro)}</p>
+    <div class="card-grid">
+      ${cardsHtml}
+    </div>
+  </section>`;
+
+  return renderLayout({
+    title: `${title} | The Charmed Cardinal`,
+    description: intro,
+    bodyHtml,
+    canonical: url,
+  });
+}
+
+function renderShopPage(gardenFlags, digitalPatterns) {
+  const url = `${DOMAIN}/shop.html`;
+
+  const bodyHtml = `
+  <section>
+    ${renderBreadcrumb([
+      { label: "Home", href: "/" },
+      { label: "Shop" },
+    ])}
+    <h1>Shop The Charmed Cardinal</h1>
+    <p class="section-intro">
+      Browse nature-inspired garden flags and digital seamless patterns. Click any design to view details and shop directly on Etsy.
+    </p>
+
+    <h2>Garden Flags</h2>
+    <div class="card-grid">
+      ${gardenFlags.map(renderProductCard).join("")}
+    </div>
+
+    <h2 style="margin-top: 3rem;">Digital Seamless Patterns</h2>
+    <div class="card-grid">
+      ${digitalPatterns.map(renderProductCard).join("")}
+    </div>
+  </section>`;
+
+  return renderLayout({
+    title: "Shop | The Charmed Cardinal",
+    description:
+      "Shop garden flags and digital seamless patterns designed by The Charmed Cardinal.",
+    bodyHtml,
+    canonical: url,
+  });
+}
+
+function renderHomePage(products) {
+  const url = `${DOMAIN}/`;
+  const featured = products.slice(0, 6);
+
+  const bodyHtml = `
+  <section>
+    <div class="hero">
+      <div class="hero-copy">
+        <h1>Welcome to The Charmed Cardinal</h1>
+        <p>
+          Explore handcrafted garden flags, porch decor, and digital print patterns inspired by nature, dogs, and cozy outdoor living.
+        </p>
+        <div class="hero-actions">
+          <a href="/shop.html" class="etsy-btn">Browse the shop →</a>
+          <a href="${SHOP_URL}" target="_blank" rel="noopener noreferrer" class="text-link">
+            Visit Etsy →
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <section class="featured">
+      <h2>Featured Products</h2>
+      <div class="card-grid">
+        ${featured.map(renderProductCard).join("")}
+      </div>
+      <p class="section-footnote">
+        <a href="/shop.html">View all products →</a>
+      </p>
+    </section>
+  </section>`;
+
+  return renderLayout({
+    title: "The Charmed Cardinal – Garden Flags & Seamless Patterns",
+    description:
+      "Nature-inspired garden flags, porch decor, and digital seamless patterns from The Charmed Cardinal. Shop cozy outdoor designs and printable patterns.",
+    bodyHtml,
+    canonical: url,
+  });
+}
+
+function renderBlogIndexPage() {
+  const url = `${DOMAIN}/blog/`;
+
+  const bodyHtml = `
+  <section>
+    ${renderBreadcrumb([
+      { label: "Home", href: "/" },
+      { label: "Blog" },
+    ])}
+    <h1>Blog</h1>
+    <p class="section-intro">
+      Styling ideas, porch inspiration, and tips for decorating with garden flags and patterns.
+    </p>
+    <ul class="blog-list">
+      <li>
+        <a href="/blog/style-your-porch-with-garden-flags.html">
+          Style Your Porch with Garden Flags
+        </a>
+      </li>
+    </ul>
+  </section>`;
+
+  return renderLayout({
+    title: "Blog | The Charmed Cardinal",
+    description:
+      "Styling tips and ideas for decorating your porch with garden flags and seasonal designs.",
+    bodyHtml,
+    canonical: url,
+  });
+}
+
+// ----------------- Sitemap -----------------
+
+function buildSitemap(products) {
+  const staticPages = [
+    "",
+    "index.html",
+    "about.html",
+    "shop.html",
+    "blog/",
+    "blog/style-your-porch-with-garden-flags.html",
+    "products/garden-flags.html",
+    "products/digital-patterns.html",
+  ];
+
+  let xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+`;
+
+  staticPages.forEach((p) => {
+    const loc = p ? `${DOMAIN}/${p}` : `${DOMAIN}/`;
+    xml += `  <url><loc>${loc}</loc></url>\n`;
+  });
+
+  products.forEach((p) => {
+    xml += `  <url><loc>${DOMAIN}/products/${p.slug}.html</loc></url>\n`;
+  });
+
+  xml += `</urlset>\n`;
+  return xml;
+}
+
+// ----------------- MAIN BUILD -----------------
+
+(async function build() {
+  try {
+    console.log("\n🚀 BUILD START\n");
+
+    ensureDir(DATA_DIR);
+    ensureDir(ASSET_PRODUCT_DIR);
+
+    const rssItems = await fetchRssItems();
+    const products = buildProductsFromRss(rssItems);
+
+    await hydrateProductImages(products);
+
+    // Sort by title for deterministic order
+    products.sort((a, b) => a.title.localeCompare(b.title));
+
+    // Save JSON for debugging
+    writeFile(
+      path.join(DATA_DIR, "products.json"),
+      JSON.stringify(
+        products.map((p) => ({
+          slug: p.slug,
+          title: p.title,
+          type: p.type,
+          description: p.description,
+          price: p.price,
+          etsy: p.etsy,
+          image: p.imageWebPath,
+        })),
+        null,
+        2
+      )
+    );
+    console.log("✓ Saved data/products.json");
+
+    const gardenFlags = products.filter((p) => p.type === "garden-flag");
+    const digitalPatterns = products.filter(
+      (p) => p.type === "digital-pattern"
+    );
+
+    // Product pages
+    products.forEach((p) => {
+      const html = renderProductPage(p);
+      const outPath = path.join(OUT_ROOT, "products", `${p.slug}.html`);
+      writeFile(outPath, html);
+      // console.log("✓ Product page:", outPath);
+    });
+
+    // Category pages
+    const gardenFlagsPage = renderCategoryPage({
+      title: "Garden Flags",
+      slug: "garden-flags",
+      intro:
+        "Decorative garden flags for porches, patios, balconies, and front yards – featuring plants, dogs, kindness, and eco-friendly messages.",
+      items: gardenFlags,
+    });
+    writeFile(
+      path.join(OUT_ROOT, "products", "garden-flags.html"),
+      gardenFlagsPage
+    );
+
+    const digitalPatternsPage = renderCategoryPage({
+      title: "Digital Seamless Patterns",
+      slug: "digital-patterns",
+      intro:
+        "High-resolution seamless patterns for fabric, wrapping paper, print-on-demand products, and digital craft projects.",
+      items: digitalPatterns,
+    });
+    writeFile(
+      path.join(OUT_ROOT, "products", "digital-patterns.html"),
+      digitalPatternsPage
+    );
+
+    // Shop page
+    const shopHtml = renderShopPage(gardenFlags, digitalPatterns);
+    writeFile(path.join(OUT_ROOT, "shop.html"), shopHtml);
+
+    // Home page
+    const homeHtml = renderHomePage(products);
+    writeFile(path.join(OUT_ROOT, "index.html"), homeHtml);
+
+    // Blog index
+    const blogHtml = renderBlogIndexPage();
+    writeFile(path.join(OUT_ROOT, "blog", "index.html"), blogHtml);
+
+    // Sitemap
+    const sitemap = buildSitemap(products);
+    writeFile(path.join(OUT_ROOT, "sitemap.xml"), sitemap);
+    console.log("✓ Sitemap: sitemap.xml");
+
+    console.log("\n✅ BUILD COMPLETE — images, cards, and pages generated.\n");
+  } catch (err) {
+    console.error("\n❌ BUILD FAILED:", err);
+    process.exit(1);
+  }
+})();
