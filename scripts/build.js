@@ -95,7 +95,7 @@ async function fetchListingUrls() {
 }
 
 /* -----------------------------------------
-   PUPPETEER LISTING SCRAPER (JSON-LD)
+   PUPPETEER LISTING SCRAPER (JSON-LD + FALLBACK)
 ----------------------------------------- */
 
 async function scrapeListing(url, browser) {
@@ -118,29 +118,82 @@ async function scrapeListing(url, browser) {
     timeout: 60000,
   });
 
-  const jsonLd = await page.$$eval(
-    'script[type="application/ld+json"]',
-    (nodes) => nodes.map((n) => n.textContent)
-  );
+  // Extract JSON-LD Product block
+  async function getJsonLdProduct() {
+    const blocks = await page.$$eval(
+      'script[type="application/ld+json"]',
+      (nodes) => nodes.map((n) => n.textContent)
+    );
 
-  await page.close();
-
-  // Find product JSON-LD block
-  let productData = null;
-  for (const block of jsonLd) {
-    try {
-      const data = JSON.parse(block);
-      if (data["@type"] === "Product") {
-        productData = data;
-        break;
-      }
-    } catch (e) {}
+    for (const block of blocks) {
+      try {
+        const parsed = JSON.parse(block);
+        if (parsed["@type"] === "Product") return parsed;
+      } catch (_) {}
+    }
+    return null;
   }
 
+  let productData = await getJsonLdProduct();
+
+  // Scroll & re-check JSON-LD
   if (!productData) {
-    throw new Error("No JSON-LD Product block");
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1200);
+    productData = await getJsonLdProduct();
   }
 
+  // Scroll to top again
+  if (!productData) {
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(800);
+    productData = await getJsonLdProduct();
+  }
+
+  // FINAL fallback to OG tags
+  if (!productData) {
+    console.log("⚠ JSON-LD missing — falling back to OG tags.");
+
+    const html = await page.content();
+    await page.close();
+
+    const extractMeta = (attr, name) => {
+      const regex = new RegExp(
+        `<meta[^>]+${attr}=["']${name}["'][^>]+content=["']([^"']+)["']`,
+        "i"
+      );
+      const match = html.match(regex);
+      return match ? match[1] : null;
+    };
+
+    const title =
+      extractMeta("property", "og:title") ||
+      extractMeta("name", "title") ||
+      "Untitled";
+
+    const description =
+      extractMeta("property", "og:description") ||
+      extractMeta("name", "description") ||
+      "";
+
+    const mainImage = extractMeta("property", "og:image");
+
+    const id = (url.match(/listing\/(\d+)/) || [])[1] || "";
+    const slug =
+      `${slugify(title)}-by-thecharmedcardinal-${id}`.substring(0, 180);
+
+    return {
+      id,
+      slug,
+      title,
+      description,
+      etsy: url,
+      mainImage,
+      type: detectType(title + " " + description),
+    };
+  }
+
+  /* JSON-LD SUCCESS */
   const title = (productData.name || "Untitled").trim();
   const description = (productData.description || "").trim();
 
@@ -154,7 +207,7 @@ async function scrapeListing(url, browser) {
   const slug =
     `${slugify(title)}-by-thecharmedcardinal-${id}`.substring(0, 180);
 
-  const type = detectType(title + " " + description);
+  await page.close();
 
   return {
     id,
@@ -163,7 +216,7 @@ async function scrapeListing(url, browser) {
     description,
     etsy: url,
     mainImage,
-    type,
+    type: detectType(title + " " + description),
   };
 }
 
@@ -249,9 +302,8 @@ ${body}
 
     await browser.close();
 
-    // Save JSON for debugging
+    // Save JSON
     writeFile("data/products.json", JSON.stringify(products, null, 2));
-
     console.log("✓ Saved products.json");
 
     /* PRODUCT PAGES */
@@ -368,7 +420,7 @@ ${body}
 
     writeFile("sitemap.xml", sitemap);
 
-    console.log("\n✅ BUILD COMPLETE — Full images extracted via JSON-LD.\n");
+    console.log("\n✅ BUILD COMPLETE — Full images extracted reliably.\n");
 
   } catch (err) {
     console.error("\n❌ BUILD FAILED:", err);
